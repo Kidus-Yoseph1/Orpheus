@@ -1,0 +1,8 @@
+/target/
+**/*.rs.bk
+.env
+# personal books — never commit
+*.epub
+*.pdf
+# environment tooling
+.agents/

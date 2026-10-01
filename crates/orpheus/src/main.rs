@@ -1,0 +1,484 @@
+mod app;
+mod cli;
+mod ui;
+
+use std::io::stdout;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::Result;
+use clap::Parser;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
+use tracing_subscriber::EnvFilter;
+
+use app::{App, PlaybackState, Screen};
+use cli::{Cli, Commands};
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+
+    let cli = Cli::parse();
+    let mut config = orpheus_core::Config::load();
+    if let Some(t) = &cli.theme {
+        config.reader.theme = t.clone();
+    }
+    if let Some(s) = &cli.style {
+        config.reader.style = s.clone();
+    }
+    if let Some(m) = &cli.model {
+        config.tts.model = m.clone();
+    }
+    if let Some(v) = &cli.voice {
+        config.tts.voice = v.clone();
+    }
+
+    let db_path = orpheus_core::Config::db_path();
+    let db = orpheus_core::LibraryDb::open(&db_path)?;
+    let mut app = App::new(config, db);
+    app.tts
+        .select_model(&app.config.tts.model.clone())
+        .unwrap_or(());
+    app.tts.current_voice_id = app.config.tts.voice.clone();
+    app.speed = app.config.playback.speed;
+    app.refresh_recent();
+
+    // CLI routing (GUIDE §29).
+    if let Some(cmd) = &cli.command {
+        match cmd {
+            Commands::Voices => app.goto(Screen::Voices),
+            Commands::Models => app.goto(Screen::Models),
+            Commands::Config => {
+                let p = orpheus_core::Config::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(no config dir)".into());
+                println!("config: {p}\n{}", toml::to_string_pretty(&app.config)?);
+                return Ok(());
+            }
+        }
+    }
+    if let Some(path) = &cli.path {
+        if path.is_dir() {
+            app.open_directory(path.clone(), true);
+        } else if path.is_file() {
+            if let Err(e) = app.open_book_file(path) {
+                eprintln!("could not open {}: {e:#}", path.display());
+            }
+        } else {
+            eprintln!("path not found: {}", path.display());
+        }
+    }
+
+    run_tui(&mut app)?;
+    // Persist on exit.
+    app.persist_position();
+    app.config.reader.theme = app.theme.name.clone();
+    app.config.reader.style = app.style.name().to_string();
+    app.config.playback.speed = app.speed;
+    app.config.tts.model = app.tts.current_model_id.clone();
+    app.config.tts.voice = app.tts.current_voice_id.clone();
+    let _ = app.config.save();
+    Ok(())
+}
+
+fn run_tui(app: &mut App) -> Result<()> {
+    enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
+    let mut term = Terminal::new(backend)?;
+
+    let mut last_tick = std::time::Instant::now();
+    let tick_rate = Duration::from_millis(250);
+
+    loop {
+        term.draw(|f| ui::render(f, app))?;
+
+        let timeout = tick_rate
+            .checked_sub(last_tick.elapsed())
+            .unwrap_or_else(|| Duration::from_secs(0));
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // Ctrl+C always quits.
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+                    app.should_quit = true;
+                } else {
+                    handle_key(app, key.code, key.modifiers);
+                }
+            }
+        }
+        if last_tick.elapsed() >= tick_rate {
+            on_tick(app);
+            last_tick = std::time::Instant::now();
+        }
+        if app.should_quit {
+            break;
+        }
+    }
+
+    disable_raw_mode()?;
+    execute!(term.backend_mut(), LeaveAlternateScreen)?;
+    term.show_cursor()?;
+    Ok(())
+}
+
+/// Mock narration advance: while Playing, step the highlight forward.
+fn on_tick(app: &mut App) {
+    if app.playback != PlaybackState::Playing {
+        return;
+    }
+    if app.screen != Screen::Reader {
+        return;
+    }
+    // ~140 WPM baseline scaled by speed; tick is 250ms → advance probabilistically.
+    // Simple deterministic version: advance every (8/speed) ticks ≈ 2s at 1x.
+    static mut COUNTER: u8 = 0;
+    unsafe {
+        COUNTER += 1;
+        let every = ((8.0 / app.speed).round() as u8).clamp(2, 16);
+        if COUNTER >= every {
+            COUNTER = 0;
+            // Don't run past end.
+            if app.sentence_cursor + 1 < app.total_sentences() {
+                app.next_sentence();
+            } else {
+                app.playback = PlaybackState::Stopped;
+                app.status_msg = Some("■ finished chapter/book".into());
+            }
+        }
+    }
+}
+
+fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    app.status_msg = None;
+    match app.screen {
+        Screen::Home => home_key(app, code, mods),
+        Screen::Directory => dir_key(app, code, mods),
+        Screen::Reader => reader_key(app, code, mods),
+        Screen::Models => models_key(app, code, mods),
+        Screen::Appearance => appearance_key(app, code, mods),
+        Screen::Voices => {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+                app.go_back();
+            }
+        }
+        Screen::Help => {
+            if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+                app.go_back();
+            }
+        }
+        Screen::Search => search_key(app, code, mods),
+    }
+}
+
+fn home_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    match code {
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('?') => app.goto(Screen::Help),
+        KeyCode::Char('m') => app.goto(Screen::Models),
+        KeyCode::Char('v') => app.goto(Screen::Voices),
+        KeyCode::Char('t') => app.open_appearance(),
+        KeyCode::Char('o') => {
+            let dir = default_books_dir();
+            app.open_directory(dir, true);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.home_selected > 0 {
+                app.home_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.home_selected + 1 < app.recent.len() {
+                app.home_selected += 1;
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(b) = app.recent.get(app.home_selected) {
+                let id = b.id.clone();
+                let _ = app.db.remove_book(&id);
+                app.refresh_recent();
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(b) = app.recent.get(app.home_selected).cloned() {
+                let p = PathBuf::from(&b.path);
+                if let Err(e) = app.open_book_file(&p) {
+                    app.status_msg = Some(format!("open failed: {e:#}"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn dir_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    match code {
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Esc => app.goto(Screen::Home),
+        KeyCode::Char('?') => app.goto(Screen::Help),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.dir_selected > 0 {
+                app.dir_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.dir_selected + 1 < app.dir_entries.len() {
+                app.dir_selected += 1;
+            }
+        }
+        KeyCode::Char('r') => {
+            if let Some(d) = app.dir_path.clone() {
+                app.open_directory(d, true);
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(e) = app.dir_entries.get(app.dir_selected).cloned() {
+                if let Err(err) = app.open_book_file(&e.path) {
+                    app.status_msg = Some(format!("open failed: {err:#}"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+    let shift = mods.contains(KeyModifiers::SHIFT);
+    match code {
+        KeyCode::Char('q') => {
+            app.persist_position();
+            app.should_quit = true;
+        }
+        KeyCode::Esc => {
+            app.persist_position();
+            app.go_back();
+        }
+        KeyCode::Char('?') => app.goto(Screen::Help),
+        KeyCode::Char(' ') => app.toggle_play(),
+        KeyCode::Left => {
+            if shift {
+                app.prev_sentence();
+            } else {
+                for _ in 0..app.config.playback.seek_seconds.max(1).min(5) {
+                    app.prev_sentence();
+                }
+            }
+        }
+        KeyCode::Right => {
+            if shift {
+                app.next_sentence();
+            } else {
+                for _ in 0..app.config.playback.seek_seconds.max(1).min(5) {
+                    app.next_sentence();
+                }
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if mods.contains(KeyModifiers::CONTROL) {
+                app.scroll = app.scroll.saturating_sub(10);
+            } else {
+                app.scroll = app.scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.scroll = app.scroll.saturating_add(1);
+        }
+        KeyCode::Char('n') => app.next_chapter(),
+        KeyCode::Char('p') => app.prev_chapter(),
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            app.set_speed(app.speed + 0.1);
+            app.status_msg = Some(format!("speed {:.2}x", app.speed));
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            app.set_speed(app.speed - 0.1);
+            app.status_msg = Some(format!("speed {:.2}x", app.speed));
+        }
+        KeyCode::Char('0') => {
+            app.set_speed(1.0);
+            app.status_msg = Some("speed 1.00x".into());
+        }
+        KeyCode::Char('/') => {
+            app.search_query.clear();
+            app.searching = true;
+            app.goto(Screen::Search);
+        }
+        KeyCode::Char('b') => {
+            if let Some(book) = &app.book {
+                let _ = app.db.add_bookmark(
+                    &book.id,
+                    app.chapter_idx as i64,
+                    app.sentence_cursor as i64,
+                    "",
+                );
+                app.status_msg = Some("★ bookmarked".into());
+            }
+        }
+        KeyCode::Char('v') => app.goto(Screen::Voices),
+        KeyCode::Char('m') => app.goto(Screen::Models),
+        KeyCode::Char('t') => app.open_appearance(),
+        KeyCode::Char('g') => {
+            app.scroll = 0;
+            app.chapter_idx = 0;
+            app.rebuild_chapter_lines();
+            app.snap_cursor_to_chapter();
+            app.sentence_cursor = app.chapter_start_global();
+        }
+        KeyCode::Char('G') => {
+            if let Some(b) = &app.book {
+                app.chapter_idx = b.chapters.len().saturating_sub(1);
+                app.rebuild_chapter_lines();
+                app.snap_cursor_to_chapter();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn models_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    if app.model_typing {
+        match code {
+            KeyCode::Esc => app.model_typing = false,
+            KeyCode::Enter => {
+                let id = app.model_input.trim().to_string();
+                if !id.is_empty() {
+                    // "Type a model name and pull it on the fly" (user req):
+                    // register immediately, select it, mark for worker pull.
+                    let _ = app.tts.select_model(&id);
+                    app.status_msg = Some(format!(
+                        "model '{id}' queued — worker will pull on first synthesis (M5/6)"
+                    ));
+                    app.model_input.clear();
+                    app.model_typing = false;
+                    app.goto(Screen::Reader);
+                }
+            }
+            KeyCode::Backspace => {
+                app.model_input.pop();
+            }
+            KeyCode::Char(c) => app.model_input.push(c),
+            _ => {}
+        }
+        return;
+    }
+    let n = app.tts.list_models().len();
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.go_back(),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.model_selected > 0 {
+                app.model_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.model_selected + 1 < n {
+                app.model_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            let models = app.tts.list_models();
+            if let Some(m) = models.get(app.model_selected) {
+                let id = m.id.clone();
+                let _ = app.tts.select_model(&id);
+                app.tts.current_voice_id = format!("{id}-default");
+                app.status_msg = Some(format!("model → {id} (position kept)"));
+                app.go_back();
+            }
+        }
+        KeyCode::Char('/') | KeyCode::Char('i') => {
+            app.model_typing = true;
+            app.model_input.clear();
+        }
+        _ => {}
+    }
+}
+
+fn appearance_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    let theme_count = orpheus_core::Theme::builtin_names().len();
+    let style_count = orpheus_core::ReaderStyle::all().len();
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => app.go_back(),
+        KeyCode::Tab | KeyCode::BackTab => {
+            app.appearance_section = (app.appearance_section + 1) % 2;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.appearance_section == 0 {
+                if app.theme_selected > 0 {
+                    app.theme_selected -= 1;
+                }
+                // Live preview: apply immediately.
+                app.apply_appearance_selection();
+            } else if app.style_selected > 0 {
+                app.style_selected -= 1;
+                app.apply_appearance_selection();
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.appearance_section == 0 {
+                if app.theme_selected + 1 < theme_count {
+                    app.theme_selected += 1;
+                }
+                app.apply_appearance_selection();
+            } else if app.style_selected + 1 < style_count {
+                app.style_selected += 1;
+                app.apply_appearance_selection();
+            }
+        }
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            app.apply_appearance_selection();
+            app.go_back();
+        }
+        _ => {}
+    }
+}
+
+fn search_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    match code {
+        KeyCode::Esc => {
+            app.searching = false;
+            app.go_back();
+        }
+        KeyCode::Enter => {
+            // Jump to first hit.
+            let q = app.search_query.to_lowercase();
+            if let Some(book) = &app.book {
+                // Walk flat sentences.
+                let flat = book.flat_sentences();
+                for (idx, (ci, _, _, s)) in flat.iter().enumerate() {
+                    if s.text.to_lowercase().contains(&q) {
+                        app.chapter_idx = *ci;
+                        app.rebuild_chapter_lines();
+                        app.sentence_cursor = idx;
+                        app.persist_position();
+                        break;
+                    }
+                }
+            }
+            app.searching = false;
+            app.goto(Screen::Reader);
+        }
+        KeyCode::Backspace => {
+            app.search_query.pop();
+        }
+        KeyCode::Char(c) => app.search_query.push(c),
+        _ => {}
+    }
+}
+
+fn default_books_dir() -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        let books = home.join("Books");
+        if books.is_dir() {
+            return books;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
