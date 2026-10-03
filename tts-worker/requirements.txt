@@ -1,0 +1,14 @@
+# Worker dependencies. Validated against kokoro 0.9.4 + OpenVoice git HEAD.
+# Install via install.sh (OpenVoice needs --no-deps; see header comments).
+kokoro==0.9.4
+huggingface_hub>=0.23
+hf_transfer>=0.1
+faster-whisper
+whisper-timestamped
+soundfile
+librosa
+eng-to-ipa
+pypinyin
+g2p-en
+jieba
+cn2an

@@ -4,5 +4,17 @@
 # personal books — never commit
 *.epub
 *.pdf
+# personal audio (book chapters, voice samples) — never commit
+/voices/
+*.mp3
+*.wav
+*.m4a
+*.flac
+*.ogg
+*.opus
 # environment tooling
 .agents/
+# python worker envs + bytecode (recreated from requirements.txt)
+tts-worker/.venv*/
+tts-worker/__pycache__/
+__pycache__/

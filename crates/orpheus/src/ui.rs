@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line as RLine, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
 };
 
@@ -28,6 +28,7 @@ pub fn render(f: &mut Frame, app: &App) {
         Screen::Reader => render_reader(f, app),
         Screen::Models => render_models(f, app),
         Screen::Voices => render_voices(f, app),
+        Screen::VoiceEditor => render_voice_editor(f, app),
         Screen::Appearance => render_appearance(f, app),
         Screen::Help => render_help(f, app),
         Screen::Search => render_search(f, app),
@@ -199,12 +200,9 @@ fn render_home(f: &mut Frame, app: &App) {
             })
             .collect()
     };
+    scroll_list(f, chunks[3], items, app.home_selected, app);
     f.render_widget(
-        List::new(items).style(Style::default().bg(app.theme.bg())),
-        chunks[3],
-    );
-    f.render_widget(
-        hint_bar(
+        footer_msg(
             app,
             "enter open · o folder · t appearance · m models · v voices · ? help · q quit",
         ),
@@ -290,17 +288,19 @@ fn render_directory(f: &mut Frame, app: &App) {
             }
         })
         .collect();
-    let list = List::new(if items.is_empty() {
+    let items = if items.is_empty() {
         vec![ListItem::new(RLine::from(vec![Span::styled(
             "  No .epub / .pdf here — press r to rescan",
             muted(app),
         )]))]
     } else {
         items
-    })
-    .style(Style::default().bg(app.theme.bg()));
-    f.render_widget(list, chunks[1]);
-    f.render_widget(hint_bar(app, "enter open · r rescan · esc back"), chunks[2]);
+    };
+    scroll_list(f, chunks[1], items, app.dir_selected, app);
+    f.render_widget(
+        footer_msg(app, "enter open · r rescan · esc back"),
+        chunks[2],
+    );
 }
 
 // --- Reader (Foliate-style page) -------------------------------------------------
@@ -649,13 +649,32 @@ fn render_reader_footer(f: &mut Frame, app: &App, pct: f32, area: Rect, minimal:
         .style(Style::default().bg(app.theme.bg())),
         info[1],
     );
-    f.render_widget(
-        hint_bar(
-            app,
-            "space play · ←/→ sentence · n/p chapter · j/k scroll · / find · t looks · ? help",
-        ),
-        top[2],
-    );
+    if let Some(msg) = &app.status_msg {
+        // Transient feedback (buffering…, audio errors, speed, bookmarks…)
+        // takes over the hint line so it is never invisible.
+        f.render_widget(
+            Paragraph::new(
+                RLine::from(vec![Span::styled(
+                    format!("  {msg}"),
+                    Style::default()
+                        .fg(app.theme.accent_c())
+                        .bg(app.theme.bg())
+                        .add_modifier(Modifier::BOLD),
+                )])
+                .alignment(Alignment::Center),
+            )
+            .style(Style::default().bg(app.theme.bg())),
+            top[2],
+        );
+    } else {
+        f.render_widget(
+            hint_bar(
+                app,
+                "space play · ←/→ sentence · n/p chapter · j/k scroll · / find · t looks · ? help",
+            ),
+            top[2],
+        );
+    }
 }
 
 fn short_voice(id: &str) -> String {
@@ -793,10 +812,7 @@ fn render_appearance(f: &mut Frame, app: &App) {
         .style(Style::default().bg(app.theme.bg())),
         theme_inner[0],
     );
-    f.render_widget(
-        List::new(theme_items).style(Style::default().bg(app.theme.bg())),
-        theme_inner[1],
-    );
+    scroll_list(f, theme_inner[1], theme_items, app.theme_selected, app);
 
     // Live preview line in the *currently selected-for-cursor* theme.
     let preview_theme = theme_names
@@ -895,13 +911,10 @@ fn render_appearance(f: &mut Frame, app: &App) {
         .style(Style::default().bg(app.theme.bg())),
         style_inner[0],
     );
-    f.render_widget(
-        List::new(style_items).style(Style::default().bg(app.theme.bg())),
-        style_inner[1],
-    );
+    scroll_list(f, style_inner[1], style_items, app.style_selected, app);
 
     f.render_widget(
-        hint_bar(app, "tab section · ↑/↓ move · enter apply · esc back"),
+        footer_msg(app, "tab section · ↑/↓ move · enter apply · esc back"),
         chunks[4],
     );
 }
@@ -1007,10 +1020,7 @@ fn render_models(f: &mut Frame, app: &App) {
             }
         })
         .collect();
-    f.render_widget(
-        List::new(items).style(Style::default().bg(app.theme.bg())),
-        chunks[1],
-    );
+    scroll_list(f, chunks[1], items, app.model_selected, app);
 
     let input = Paragraph::new(RLine::from(vec![
         Span::styled("  pull: ", muted(app)),
@@ -1033,11 +1043,7 @@ fn render_models(f: &mut Frame, app: &App) {
     );
     f.render_widget(input, chunks[2]);
     f.render_widget(
-        Paragraph::new(RLine::from(vec![Span::styled(
-            "  Switching never moves your place in the book.",
-            muted(app),
-        )]))
-        .style(Style::default().bg(app.theme.bg())),
+        footer_msg(app, "switching never moves your place in the book"),
         chunks[3],
     );
 }
@@ -1058,7 +1064,7 @@ fn render_voices(f: &mut Frame, app: &App) {
     f.render_widget(
         Paragraph::new(
             RLine::from(vec![Span::styled(
-                "Voices",
+                format!("Voices — {}", app.tts.current_model_id),
                 Style::default()
                     .fg(app.theme.heading_c())
                     .bg(app.theme.bg())
@@ -1069,45 +1075,198 @@ fn render_voices(f: &mut Frame, app: &App) {
         .style(Style::default().bg(app.theme.bg())),
         chunks[0],
     );
-    let items = vec![
-        ListItem::new(RLine::from(vec![
-            Span::styled(
-                "› ",
-                Style::default()
-                    .fg(app.theme.accent_c())
-                    .bg(app.theme.bg())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                app.tts.current_voice_id.clone(),
-                Style::default()
-                    .fg(app.theme.fg())
-                    .bg(app.theme.bg())
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(format!("  · {}", app.tts.current_model_id), muted(app)),
-        ])),
-        ListItem::new(RLine::from(vec![Span::styled(
-            "  voice cloning (reference audio) arrives with the TTS worker",
+    let items: Vec<ListItem> = app
+        .voice_list
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let current = v.id == app.tts.current_voice_id;
+            let marker = if current {
+                "● "
+            } else if i == app.voice_selected {
+                "› "
+            } else {
+                "  "
+            };
+            let (fg, bg, mods) = if i == app.voice_selected {
+                (
+                    app.theme.current_c(),
+                    app.theme.selection_c(),
+                    Modifier::BOLD,
+                )
+            } else {
+                (app.theme.fg(), app.theme.bg(), Modifier::empty())
+            };
+            ListItem::new(RLine::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(app.theme.accent_c())
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    v.id.clone(),
+                    Style::default().fg(fg).bg(bg).add_modifier(mods),
+                ),
+                Span::styled(
+                    format!("  · {}", v.note),
+                    Style::default().fg(app.theme.muted_c()).bg(bg),
+                ),
+            ]))
+        })
+        .collect();
+    let items = if items.is_empty() {
+        vec![ListItem::new(RLine::from(vec![Span::styled(
+            "  (no voices — pull a model first)",
             muted(app),
-        )])),
-        ListItem::new(RLine::from(vec![Span::styled(
-            "  a add · p preview · r rename · d delete — stubbed for now",
-            muted(app),
-        )])),
-    ];
+        )]))]
+    } else {
+        items
+    };
+    scroll_list(f, chunks[1], items, app.voice_selected, app);
     f.render_widget(
-        List::new(items).style(Style::default().bg(app.theme.bg())),
-        chunks[1],
-    );
-    f.render_widget(
-        Paragraph::new(RLine::from(vec![Span::styled(
-            "  Kokoro ships built-in voices · Chatterbox clones from a sample",
-            muted(app),
-        )]))
-        .style(Style::default().bg(app.theme.bg())),
+        footer_msg(
+            app,
+            "enter select · a add sample · p preview · d delete clone · esc back",
+        ),
         chunks[2],
     );
+}
+
+// --- Voice editor (add-voice form) -----------------------------------------------
+
+fn render_voice_editor(f: &mut Frame, app: &App) {
+    let col = book_column(f.area(), 62);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Min(6),
+            Constraint::Length(2),
+        ])
+        .split(col);
+
+    f.render_widget(
+        Paragraph::new(
+            RLine::from(vec![Span::styled(
+                "Add voice",
+                Style::default()
+                    .fg(app.theme.heading_c())
+                    .bg(app.theme.bg())
+                    .add_modifier(Modifier::BOLD),
+            )])
+            .alignment(Alignment::Center),
+        )
+        .style(Style::default().bg(app.theme.bg())),
+        chunks[0],
+    );
+
+    let name_field = Paragraph::new(RLine::from(vec![
+        Span::styled(
+            app.ve_name.clone(),
+            Style::default().fg(app.theme.fg()).bg(app.theme.bg()),
+        ),
+        Span::styled(
+            if app.ve_field == 0 { "▌" } else { "" },
+            Style::default().fg(app.theme.muted_c()).bg(app.theme.bg()),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .title(if app.ve_field == 0 {
+                "▶ name "
+            } else {
+                "  name "
+            })
+            .title_style(Style::default().fg(app.theme.muted_c()).bg(app.theme.bg()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border_c()).bg(app.theme.bg()))
+            .style(Style::default().bg(app.theme.bg())),
+    );
+    f.render_widget(name_field, chunks[1]);
+
+    let path_field = Paragraph::new(RLine::from(vec![
+        Span::styled(
+            app.ve_path.clone(),
+            Style::default().fg(app.theme.fg()).bg(app.theme.bg()),
+        ),
+        Span::styled(
+            if app.ve_field == 1 { "▌" } else { "" },
+            Style::default().fg(app.theme.muted_c()).bg(app.theme.bg()),
+        ),
+    ]))
+    .block(
+        Block::default()
+            .title(if app.ve_field == 1 {
+                "▶ sample file (~/voices/<file> or full path) "
+            } else {
+                "  sample file "
+            })
+            .title_style(Style::default().fg(app.theme.muted_c()).bg(app.theme.bg()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border_c()).bg(app.theme.bg()))
+            .style(Style::default().bg(app.theme.bg())),
+    );
+    f.render_widget(path_field, chunks[2]);
+
+    // Samples found in ~/voices for reference.
+    let mut lines = vec![RLine::from(vec![Span::styled(
+        "  samples in ~/voices/:",
+        muted(app),
+    )])];
+    match home_voices() {
+        v if v.is_empty() => lines.push(RLine::from(vec![Span::styled(
+            "  (none yet — put a wav/mp3/flac there)",
+            muted(app),
+        )])),
+        v => {
+            for name in v.into_iter().take(12) {
+                lines.push(RLine::from(vec![Span::styled(
+                    format!("  {name}"),
+                    Style::default().fg(app.theme.fg()).bg(app.theme.bg()),
+                )]));
+            }
+        }
+    }
+    lines.push(RLine::from(""));
+    lines.push(RLine::from(vec![Span::styled(
+        "  3s+ clean single-speaker clip; the original is never modified.",
+        muted(app),
+    )]));
+    f.render_widget(
+        Paragraph::new(Text::from(lines)).style(Style::default().bg(app.theme.bg())),
+        chunks[3],
+    );
+    f.render_widget(
+        footer_msg(app, "tab field · type · enter next/save · esc cancel"),
+        chunks[4],
+    );
+}
+
+fn home_voices() -> Vec<String> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(home.join("voices")) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            matches!(
+                p.extension().and_then(|x| x.to_str()).map(str::to_lowercase),
+                Some(e) if ["wav", "mp3", "flac", "m4a", "ogg", "opus"].contains(&e.as_str())
+            )
+            .then(|| p.file_name()?.to_str().map(str::to_string))
+            .flatten()
+        })
+        .collect();
+    out.sort();
+    out
 }
 
 // --- Help --------------------------------------------------------------------
@@ -1130,6 +1289,10 @@ fn render_help(f: &mut Frame, app: &App) {
         ("home", "enter open · o folder · d forget book"),
         ("shelf", "enter open · r rescan · esc back"),
         ("models", "enter select · / type id to pull"),
+        (
+            "voices",
+            "enter select · a add · p preview · d delete · pgup/pgdn",
+        ),
     ];
     let mut lines = vec![
         RLine::from(vec![Span::styled(
@@ -1263,6 +1426,27 @@ fn render_search(f: &mut Frame, app: &App) {
 
 // --- shared ------------------------------------------------------------------
 
+/// A list that follows the cursor: keeps `selected` visible by offsetting
+/// the viewport. Plain `List` renders from the top and strands everything
+/// below the fold (voices, shelves, search hits).
+fn scroll_list(f: &mut Frame, area: Rect, items: Vec<ListItem<'_>>, selected: usize, app: &App) {
+    let vis = area.height.max(1) as usize;
+    let offset = selected.saturating_sub(vis.saturating_sub(1));
+    let mut state = ListState::default()
+        .with_selected(if items.is_empty() {
+            None
+        } else {
+            Some(selected.min(items.len().saturating_sub(1)))
+        })
+        .with_offset(offset);
+    // Selection is painted manually per-row; neutralize the default
+    // reversed highlight so it doesn't double up.
+    let list = List::new(items)
+        .highlight_style(Style::default())
+        .style(Style::default().bg(app.theme.bg()));
+    f.render_stateful_widget(list, area, &mut state);
+}
+
 fn hint_bar(app: &App, text: &str) -> Paragraph<'static> {
     Paragraph::new(
         RLine::from(vec![Span::styled(
@@ -1272,6 +1456,27 @@ fn hint_bar(app: &App, text: &str) -> Paragraph<'static> {
         .alignment(Alignment::Center),
     )
     .style(Style::default().bg(app.theme.bg()))
+}
+
+/// Footer line with a voice: transient status (errors, confirmations,
+/// progress) replaces the hints while present, so no screen ever fails
+/// silently. This was the actual "can't save audio" bug — the editor ran
+/// errors nobody could see.
+fn footer_msg(app: &App, hints: &str) -> Paragraph<'static> {
+    match &app.status_msg {
+        Some(msg) => Paragraph::new(
+            RLine::from(vec![Span::styled(
+                format!("  {msg}"),
+                Style::default()
+                    .fg(app.theme.accent_c())
+                    .bg(app.theme.bg())
+                    .add_modifier(Modifier::BOLD),
+            )])
+            .alignment(Alignment::Center),
+        )
+        .style(Style::default().bg(app.theme.bg())),
+        None => hint_bar(app, hints),
+    }
 }
 
 /// Thin Foliate-like rule.

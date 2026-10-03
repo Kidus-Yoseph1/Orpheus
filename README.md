@@ -6,9 +6,10 @@ Read EPUB books in a calm, Foliate-style page and listen to them with local
 text-to-speech. Terminal-first, keyboard-first, fully offline after models
 are pulled.
 
-> Status: reader + library + themes work today. TTS currently runs on a
-> `MockBackend` (highlight advances, no audio yet) behind a model-agnostic
-> trait — real Kokoro / Chatterbox synthesis via a Python worker is next.
+> Status: reader + library + themes work. Narration works via the `book-tts`
+> worker (Kokoro-82M, local GPU/CPU) + ffplay playback, including cloned
+> narrator voices (Kokoro render + OpenVoice conversion, ~1.7 GB VRAM).
+> `mock` model keeps the highlight-only timer for UI exercise.
 
 ## Features
 
@@ -25,14 +26,16 @@ are pulled.
 ## Install
 
 Requirements: Rust 1.75+ (async traits), a terminal with truecolor for best
-results.
+results, ffmpeg (provides `ffplay` for audio) for narration. Voice
+narration additionally needs the Python worker (`tts-worker/`, needs a
+conda env with torch — see “TTS: how it works” below).
 
 ```sh
-git clone <this-repo>
+git clone git@github.com:Kidus-Yoseph1/Orpheus.git
 cd Orpheus
 cargo build --release
 # binary is at ./target/release/orpheus
-# optional: install to ~/.cargo/bin
+# optional: install to ~/.cargo/bin (on PATH, so `orpheus` works anywhere)
 cargo install --path crates/orpheus
 ```
 
@@ -83,7 +86,7 @@ Styles: `classic`, `paper`, `sepia`, `midnight`, `focus`, `minimal`.
 | `/` | search in book |
 | `b` | bookmark current sentence |
 | `t` | appearance: themes + reader styles (live preview) |
-| `v` | voices |
+| `v` | voices (enter select · a add sample · p preview · d delete) |
 | `m` | TTS models |
 | `g` / `G` | first / last chapter |
 | `?` | help |
@@ -158,8 +161,9 @@ buffer_seconds = 90
 
 [tts]
 model = "kokoro"
-voice = "kokoro-default"
-device = "auto"        # auto | cpu | cuda
+voice = "kokoro-default"   # kokoro-default (= af_heart) or af_bella, am_adam, ...
+device = "auto"            # auto | cpu | cuda (worker-side, Kokoro only for now)
+worker_url = "http://127.0.0.1:8765"
 
 [tts.gpu]
 enabled = true
@@ -194,9 +198,9 @@ status = "#6c7086"
 ```
 
 Library database: `~/.local/share/orpheus/library.db` (books, positions,
-bookmarks, voices).
+bookmarks, voices, TTS model registry).
 
-## TTS: current state and next step
+## TTS: how it works
 
 The reader only talks to the `TTSBackend` trait (`crates/orpheus-tts`):
 `load_model / unload_model / list_voices / synthesize / health`. It never
@@ -204,16 +208,62 @@ branches on model names, so backends are swappable.
 
 | Model | Class | Notes |
 | ----- | ----- | ----- |
-| `kokoro` | light | good while multitasking, CPU-friendly |
-| `chatterbox-turbo` | medium | voice cloning, efficient |
-| `chatterbox` | heavy | voice cloning, best for focused listening |
-| any custom id | medium | type it in Models (`/`) — registered immediately, worker pulls on first synthesis |
+| `kokoro` | light | Kokoro-82M, local worker, CPU/GPU |
+| `chatterbox-turbo` | medium | voice cloning (worker support TBD) |
+| `chatterbox` | heavy | voice cloning (worker support TBD) |
+| any custom id | medium | type it in Models (`/`) — registered immediately |
+| `mock` | — | highlight-only timer, no audio (UI exercise) |
 
-Today `MockBackend` is wired: pressing `Space` advances the highlight on a
-timer so queue/progress UI can be exercised, but no audio is produced. The
-next milestone adds the Python worker (`tts-worker/`, Unix-socket API),
-real synthesis, the Opus audio cache, and `mpv`-based playback — without
-changing any reader code.
+### 1. Pull the models (explicit, once)
+
+```sh
+cd tts-worker
+python3 download.py --id kokoro --repo hexgrad/Kokoro-82M --backend kokoro
+python3 download.py --id openvoice-v2 --repo myshell-ai/OpenVoiceV2 --backend openvoice
+# --dry-run to preview, --rev <commit> to pin, --help for all flags
+```
+
+Files land in `~/.local/share/orpheus/models/<id>/` with a manifest;
+nothing hides in the HuggingFace cache. Kokoro is ~360 MB, OpenVoice ~130 MB.
+
+### 2. Set up the worker env (once)
+
+Reuse a conda env that already has torch+CUDA through an isolated venv —
+no giant torch re-download, base env untouched (needs system
+`libespeak-ng` for phonemization and `ffmpeg` for opus + `ffplay`):
+
+```sh
+./tts-worker/install.sh [conda-env-name]   # default env: ml_base
+```
+
+### 3. Serve + listen
+
+```sh
+tts-worker/.venv312/bin/python tts-worker/server.py --model kokoro --preload   # :8765, --help for flags
+cargo run -p orpheus -- "mybook.epub"                  # Space plays real audio
+```
+
+Playback: sentences synthesize to `~/.local/share/orpheus/cache/audio/`
+(Opus, keyed by model+voice+text so repeats are free), 3-ahead prefetch
+in background, speed via `ffplay atempo` without re-rendering. Seeks and
+chapter jumps restart instantly; synthesis happens off the key path so the
+UI never freezes — first play shows `▶ buffering…` while Kokoro loads.
+
+### 4. Clone a narrator (Kokoro VRAM + cloning)
+
+No Chatterbox needed: Kokoro renders, OpenVoice converts timbre (~1.7 GB
+total — measured). Get a 10–30s clean single-speaker clip (LibriVox
+volunteers are ideal: public domain books *and* voices):
+
+```sh
+ffmpeg -ss 90 -t 20 -i chapter03.mp3 -ar 24000 -ac 1 ~/voices/narrator.wav
+```
+
+Then in Orpheus: `v` → `a` → name it + point at the file → `Enter` saves
+(a normalized copy lands in `~/.local/share/orpheus/voices/`, original
+untouched) → `p` previews → `Enter` selects → `Space` narrates the book
+in that voice. `d` deletes a clone. The converter loads lazily on first
+clone use, so kokoro-only sessions stay at ~1.4 GB.
 
 ## Development
 
@@ -222,11 +272,15 @@ Workspace crates:
 - `crates/orpheus` — binary: CLI, TUI screens, key handling
 - `crates/orpheus-core` — `Document → Chapter → Block → Sentence` model,
   EPUB loader, text normalization, themes, config, SQLite, scanner
-- `crates/orpheus-tts` — `TTSBackend` trait, `TtsManager`, `MockBackend`
+- `crates/orpheus-tts` — `TTSBackend` trait, `TtsManager`, `MockBackend`,
+  `WorkerBackend` (HTTP), `ModelStore` (app-owned `models/<id>/` + manifest)
+- `tts-worker/` — `download.py` (explicit pulls), `server.py` (`book-tts`
+  HTTP worker: `/health`, `/voices`, `/synthesize`, `/unload`)
 
 ```sh
 cargo build              # debug build
-cargo test               # 10 tests: segmentation, EPUB + stable IDs, DB resume, TTS
+cargo test               # segmentation, EPUB + stable IDs, DB resume,
+                         # store manifests, Rust/Python cache-key parity, worker stub
 cargo fmt                # format
 cargo clippy --all       # lint
 ```
