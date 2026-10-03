@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod cli;
 mod ui;
 
@@ -42,6 +43,10 @@ fn main() -> Result<()> {
     let db_path = orpheus_core::Config::db_path();
     let db = orpheus_core::LibraryDb::open(&db_path)?;
     let mut app = App::new(config, db);
+    // Approach B store: installed models are discovered from
+    // `<data>/models/<id>/orpheus-manifest.json`, never from HF cache.
+    let model_store = app.model_store.clone();
+    app.sync_models_from_store(&model_store);
     app.tts
         .select_model(&app.config.tts.model.clone())
         .unwrap_or(());
@@ -131,31 +136,12 @@ fn run_tui(app: &mut App) -> Result<()> {
     Ok(())
 }
 
-/// Mock narration advance: while Playing, step the highlight forward.
+/// Narration advance each frame; App owns mock vs real-audio behavior.
 fn on_tick(app: &mut App) {
-    if app.playback != PlaybackState::Playing {
-        return;
-    }
-    if app.screen != Screen::Reader {
-        return;
-    }
-    // ~140 WPM baseline scaled by speed; tick is 250ms → advance probabilistically.
-    // Simple deterministic version: advance every (8/speed) ticks ≈ 2s at 1x.
-    static mut COUNTER: u8 = 0;
-    unsafe {
-        COUNTER += 1;
-        let every = ((8.0 / app.speed).round() as u8).clamp(2, 16);
-        if COUNTER >= every {
-            COUNTER = 0;
-            // Don't run past end.
-            if app.sentence_cursor + 1 < app.total_sentences() {
-                app.next_sentence();
-            } else {
-                app.playback = PlaybackState::Stopped;
-                app.status_msg = Some("■ finished chapter/book".into());
-            }
-        }
-    }
+    // Voice-save transcode runs here (not on the key press) so its
+    // "normalizing…" message paints first and keys never freeze.
+    app.tick_voice_save();
+    app.tick_playback();
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -166,11 +152,8 @@ fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         Screen::Reader => reader_key(app, code, mods),
         Screen::Models => models_key(app, code, mods),
         Screen::Appearance => appearance_key(app, code, mods),
-        Screen::Voices => {
-            if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
-                app.go_back();
-            }
-        }
+        Screen::Voices => voices_key(app, code, mods),
+        Screen::VoiceEditor => voice_editor_key(app, code, mods),
         Screen::Help => {
             if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
                 app.go_back();
@@ -185,7 +168,7 @@ fn home_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Char('?') => app.goto(Screen::Help),
         KeyCode::Char('m') => app.goto(Screen::Models),
-        KeyCode::Char('v') => app.goto(Screen::Voices),
+        KeyCode::Char('v') => app.open_voices(),
         KeyCode::Char('t') => app.open_appearance(),
         KeyCode::Char('o') => {
             let dir = default_books_dir();
@@ -234,6 +217,12 @@ fn dir_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             if app.dir_selected + 1 < app.dir_entries.len() {
                 app.dir_selected += 1;
             }
+        }
+        KeyCode::PageDown => {
+            app.dir_selected = (app.dir_selected + 10).min(app.dir_entries.len().saturating_sub(1));
+        }
+        KeyCode::PageUp => {
+            app.dir_selected = app.dir_selected.saturating_sub(10);
         }
         KeyCode::Char('r') => {
             if let Some(d) = app.dir_path.clone() {
@@ -298,14 +287,17 @@ fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('+') | KeyCode::Char('=') => {
             app.set_speed(app.speed + 0.1);
             app.status_msg = Some(format!("speed {:.2}x", app.speed));
+            app.restart_audio_if_playing();
         }
         KeyCode::Char('-') | KeyCode::Char('_') => {
             app.set_speed(app.speed - 0.1);
             app.status_msg = Some(format!("speed {:.2}x", app.speed));
+            app.restart_audio_if_playing();
         }
         KeyCode::Char('0') => {
             app.set_speed(1.0);
             app.status_msg = Some("speed 1.00x".into());
+            app.restart_audio_if_playing();
         }
         KeyCode::Char('/') => {
             app.search_query.clear();
@@ -323,7 +315,7 @@ fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
                 app.status_msg = Some("★ bookmarked".into());
             }
         }
-        KeyCode::Char('v') => app.goto(Screen::Voices),
+        KeyCode::Char('v') => app.open_voices(),
         KeyCode::Char('m') => app.goto(Screen::Models),
         KeyCode::Char('t') => app.open_appearance(),
         KeyCode::Char('g') => {
@@ -332,12 +324,14 @@ fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
             app.rebuild_chapter_lines();
             app.snap_cursor_to_chapter();
             app.sentence_cursor = app.chapter_start_global();
+            app.restart_audio_if_playing();
         }
         KeyCode::Char('G') => {
             if let Some(b) = &app.book {
                 app.chapter_idx = b.chapters.len().saturating_sub(1);
                 app.rebuild_chapter_lines();
                 app.snap_cursor_to_chapter();
+                app.restart_audio_if_playing();
             }
         }
         _ => {}
@@ -354,6 +348,11 @@ fn models_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                     // "Type a model name and pull it on the fly" (user req):
                     // register immediately, select it, mark for worker pull.
                     let _ = app.tts.select_model(&id);
+                    app.player.stop();
+                    app.buffering = false;
+                    if app.playback == PlaybackState::Playing {
+                        app.playback = PlaybackState::Paused;
+                    }
                     app.status_msg = Some(format!(
                         "model '{id}' queued — worker will pull on first synthesis (M5/6)"
                     ));
@@ -389,6 +388,12 @@ fn models_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 let id = m.id.clone();
                 let _ = app.tts.select_model(&id);
                 app.tts.current_voice_id = format!("{id}-default");
+                // Different engine, different audio: stop, press Space to start.
+                app.player.stop();
+                app.buffering = false;
+                if app.playback == PlaybackState::Playing {
+                    app.playback = PlaybackState::Paused;
+                }
                 app.status_msg = Some(format!("model → {id} (position kept)"));
                 app.go_back();
             }
@@ -440,6 +445,77 @@ fn appearance_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     }
 }
 
+fn voices_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    let n = app.voice_list.len();
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.go_back(),
+        KeyCode::Up | KeyCode::Char('k') => {
+            if app.voice_selected > 0 {
+                app.voice_selected -= 1;
+            }
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.voice_selected + 1 < n {
+                app.voice_selected += 1;
+            }
+        }
+        KeyCode::PageDown => {
+            app.voice_selected = (app.voice_selected + 10).min(n.saturating_sub(1));
+        }
+        KeyCode::PageUp => {
+            app.voice_selected = app.voice_selected.saturating_sub(10);
+        }
+        KeyCode::Enter => app.select_voice(),
+        KeyCode::Char('a') => app.open_voice_editor(),
+        KeyCode::Char('p') => app.preview_selected_voice(),
+        KeyCode::Char('d') => app.delete_selected_voice(),
+        _ => {}
+    }
+}
+
+fn voice_editor_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
+    match code {
+        KeyCode::Esc => {
+            app.pending_voice_save = None; // drop a staged save, if any
+            app.open_voices(); // cancel back to the list
+        }
+        KeyCode::Tab | KeyCode::Down | KeyCode::Up => {
+            app.ve_field = (app.ve_field + 1) % 2;
+        }
+        KeyCode::Enter => {
+            // Enter on the name field moves to the file field; Enter on the
+            // file field runs instant checks and stages the transcode, which
+            // tick_voice_save performs after the UI repaints (no freeze).
+            if app.ve_field == 0 {
+                app.ve_field = 1;
+            } else {
+                match app.prepare_voice_save() {
+                    Ok(pending) => {
+                        app.pending_voice_save = Some(pending);
+                        app.status_msg = Some("normalizing… (a few seconds, Esc backs out)".into());
+                    }
+                    Err(e) => app.status_msg = Some(e),
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if app.ve_field == 0 {
+                app.ve_name.pop();
+            } else {
+                app.ve_path.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if app.ve_field == 0 {
+                app.ve_name.push(c);
+            } else {
+                app.ve_path.push(c);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn search_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
     match code {
         KeyCode::Esc => {
@@ -458,6 +534,7 @@ fn search_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                         app.rebuild_chapter_lines();
                         app.sentence_cursor = idx;
                         app.persist_position();
+                        app.restart_audio_if_playing();
                         break;
                     }
                 }

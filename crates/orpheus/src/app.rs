@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use orpheus_core::{Config, Document, LibraryDb, ReaderStyle, Theme};
-use orpheus_tts::TtsManager;
+use orpheus_tts::{worker_cache_candidates, BackendKind, ModelStore, TtsManager, WorkerBackend};
+
+use crate::audio::FfplayPlayer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
@@ -14,6 +16,7 @@ pub enum Screen {
     Reader,
     Models,
     Voices,
+    VoiceEditor,
     Appearance,
     Help,
     Search,
@@ -72,6 +75,277 @@ pub struct App {
     pub appearance_section: usize,
     pub theme_selected: usize,
     pub style_selected: usize,
+
+    // Narration (real audio via worker + ffplay; mock timer otherwise)
+    pub player: FfplayPlayer,
+    pub rt: tokio::runtime::Runtime,
+    pub audio_cache_dir: PathBuf,
+    pub buffering: bool,
+    pub mock_tick: u8,
+
+    // Voices screen
+    pub model_store: ModelStore,
+    pub voice_list: Vec<VoiceEntry>,
+    pub voice_selected: usize,
+
+    // Voice editor (add-voice form)
+    pub ve_name: String,
+    pub ve_path: String,
+    pub ve_field: usize, // 0 = name, 1 = sample file
+    /// Validated save waiting for a tick: set on Enter (after instant
+    /// checks), consumed by tick_voice_save so the "normalizing…" message
+    /// paints BEFORE ffmpeg blocks the loop. Keys never freeze; Esc while
+    /// busy cancels back to the list on completion.
+    pub pending_voice_save: Option<PendingVoiceSave>,
+}
+
+/// Everything save_voice needs after the fast checks passed.
+#[derive(Debug, Clone)]
+pub struct PendingVoiceSave {
+    pub id: String,
+    pub name: String,
+    pub src: PathBuf,
+    pub dest: PathBuf,
+}
+
+/// One row in the Voices screen. `note` explains provenance.
+#[derive(Debug, Clone)]
+pub struct VoiceEntry {
+    pub id: String,
+    pub note: String,
+    pub custom: bool,
+}
+
+/// Build the voice list for a model from the on-disk store (no network):
+/// `<models>/<id>/voices/*.pt` stems, default first. Falls back to the
+/// current voice id alone when nothing is pulled yet.
+pub fn voices_for_model(
+    store: &ModelStore,
+    model_id: &str,
+    current_voice: &str,
+) -> (Vec<VoiceEntry>, usize) {
+    let mut ids: Vec<String> = Vec::new();
+    if let Ok(dir) = store.model_dir(model_id) {
+        if let Ok(entries) = std::fs::read_dir(dir.join("voices")) {
+            let mut stems: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().and_then(|x| x.to_str()) != Some("pt") {
+                        return None;
+                    }
+                    p.file_stem().and_then(|s| s.to_str()).map(str::to_string)
+                })
+                .collect();
+            stems.sort();
+            let def = orpheus_tts::voice_stem_default(model_id);
+            ids.push(def.clone());
+            for s in stems {
+                if s != def && !ids.contains(&s) {
+                    ids.push(s);
+                }
+            }
+        }
+    }
+    if ids.is_empty() {
+        // Nothing pulled (mock, chatterbox…): offer the current voice only.
+        ids.push(if current_voice.is_empty() {
+            orpheus_tts::voice_stem_default(model_id)
+        } else {
+            current_voice.to_string()
+        });
+    } else if !current_voice.is_empty() && !ids.contains(&current_voice.to_string()) {
+        ids.push(current_voice.to_string());
+    }
+    let def = orpheus_tts::voice_stem_default(model_id);
+    let entries = ids
+        .into_iter()
+        .map(|id| VoiceEntry {
+            note: if id == def {
+                "default".into()
+            } else {
+                "built-in".into()
+            },
+            custom: false,
+            id,
+        })
+        .collect::<Vec<_>>();
+    let sel = entries
+        .iter()
+        .position(|v| v.id == current_voice)
+        .unwrap_or(0);
+    (entries, sel)
+}
+
+/// "Sarah the Narrator" -> "sarah-the-narrator".
+pub fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    let mut dash = false;
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            dash = false;
+        } else if !dash && !out.is_empty() {
+            out.push('-');
+            dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+/// Resolve what the user typed: bare filenames look in `~/voices/` first,
+/// otherwise absolute/~/expanded paths. Must be an existing audio file.
+pub fn resolve_sample_path(input: &str) -> std::result::Result<PathBuf, String> {
+    let t = input.trim();
+    if t.is_empty() {
+        return Err("point at a sample file (wav/mp3/flac/m4a)".into());
+    }
+    let expanded = if let Some(rest) = t.strip_prefix("~/") {
+        dirs::home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|| PathBuf::from(t))
+    } else {
+        PathBuf::from(t)
+    };
+    let candidates = if expanded.is_absolute() {
+        vec![expanded]
+    } else {
+        let mut v = Vec::new();
+        if let Some(home) = dirs::home_dir() {
+            v.push(home.join("voices").join(&expanded));
+            v.push(home.join(&expanded));
+        }
+        v.push(PathBuf::from(&expanded));
+        v
+    };
+    for p in candidates {
+        if p.is_file() {
+            match p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(str::to_lowercase)
+            {
+                Some(e) if ["wav", "mp3", "flac", "m4a", "ogg", "opus"].contains(&e.as_str()) => {
+                    return Ok(p)
+                }
+                _ => return Err(format!("{} is not audio (wav/mp3/flac/m4a)", p.display())),
+            }
+        }
+    }
+    Err(format!("file not found: {t} (try ~/voices/<file>)"))
+}
+
+/// GUIDE §13: normalize a reference clip without touching the original.
+/// Mono, 24kHz, leading silence trimmed, auto-leveled. Two fast passes
+/// (measure, then fixed gain + limiter) — deliberately NOT loudnorm, which
+/// hangs for minutes on some ffmpeg builds and froze the UI.
+pub fn normalize_reference(src: &PathBuf, dest: &PathBuf) -> std::result::Result<(), String> {
+    let gain = mean_volume_db(src).map(gain_for_mean).unwrap_or(0.0);
+    let filter = format!(
+        "silenceremove=start_periods=1:start_silence=0.3:start_threshold=-50dB,volume={gain:.1}dB,alimiter=limit=0.95"
+    );
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            &src.to_string_lossy(),
+            "-ac",
+            "1",
+            "-ar",
+            "24000",
+            "-af",
+            &filter,
+            &dest.to_string_lossy(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|_| "ffmpeg not found — install ffmpeg to add voices".to_string())?;
+    if out.success() && dest.is_file() {
+        Ok(())
+    } else {
+        Err("ffmpeg could not read that file".into())
+    }
+}
+
+/// Mean volume in dB via volumedetect (realtime or faster). None when
+/// unmeasurable (silence / unreadable).
+pub fn mean_volume_db(path: &PathBuf) -> Option<f64> {
+    let out = std::process::Command::new("ffmpeg")
+        .args([
+            "-i",
+            &path.to_string_lossy(),
+            "-af",
+            "volumedetect",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-f",
+            "null",
+            "/dev/null",
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    parse_mean_volume(&String::from_utf8_lossy(&out.stderr))
+}
+
+pub fn parse_mean_volume(stderr: &str) -> Option<f64> {
+    let i = stderr.find("mean_volume:")?;
+    let rest = stderr[i + "mean_volume:".len()..].trim_start();
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '+')
+        .collect();
+    num.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// Gain to land speech near -20 dB mean: bounded so quiet clips don't
+/// explode into noise and loud ones aren't crushed.
+pub fn gain_for_mean(mean_db: f64) -> f64 {
+    (-20.0 - mean_db).clamp(-10.0, 20.0)
+}
+
+pub fn probe_secs(path: &PathBuf) -> std::result::Result<f64, String> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            &path.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|_| "ffprobe not found".to_string())?;
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| "could not read audio length".into())
+}
+
+/// Suggest the first sample found in ~/voices/ to cut typing.
+pub fn default_sample_hint() -> Option<String> {
+    let dir = dirs::home_dir()?.join("voices");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let p = e.path();
+            matches!(
+                p.extension().and_then(|x| x.to_str()).map(str::to_lowercase),
+                Some(e) if ["wav", "mp3", "flac", "m4a", "ogg", "opus"].contains(&e.as_str())
+            )
+            .then(|| p.file_name()?.to_str().map(str::to_string))
+            .flatten()
+        })
+        .collect();
+    names.sort();
+    names.into_iter().next()
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +387,21 @@ impl App {
             appearance_section: 0,
             theme_selected: 0,
             style_selected: 1,
+            player: FfplayPlayer::new(),
+            rt: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime"),
+            audio_cache_dir: Config::audio_cache_dir(),
+            buffering: false,
+            mock_tick: 0,
+            model_store: ModelStore::new(Config::data_dir().join("models")),
+            voice_list: Vec::new(),
+            voice_selected: 0,
+            ve_name: String::new(),
+            ve_path: String::new(),
+            ve_field: 0,
+            pending_voice_save: None,
             tts: TtsManager::new(),
             config,
             db,
@@ -154,6 +443,241 @@ impl App {
         }
     }
 
+    /// Approach B reconciliation: on-disk `models/<id>/` manifests plus the
+    /// `tts_models` table become the manager's installed set. Builtins like
+    /// `kokoro` flip to installed without any reader code changing.
+    pub fn sync_models_from_store(&mut self, store: &orpheus_tts::ModelStore) {
+        for (id, manifest) in store.scan_installed() {
+            let path = store
+                .model_dir(&id)
+                .unwrap_or_else(|_| PathBuf::from(&manifest.id));
+            self.tts.register_installed(&manifest, path.clone());
+            let _ = self.db.upsert_tts_model(
+                &manifest.id,
+                &manifest.backend,
+                &manifest.hf_repo,
+                &manifest.revision,
+                &path.to_string_lossy(),
+                manifest.total_bytes as i64,
+            );
+        }
+    }
+
+    // --- Voices ---------------------------------------------------------------
+
+    /// Open the picker: built-ins from the store + cloned voices from SQLite.
+    pub fn open_voices(&mut self) {
+        let model = self.tts.current_model_id.clone();
+        let (mut list, mut sel) =
+            voices_for_model(&self.model_store, &model, &self.tts.current_voice_id);
+        if let Ok(rows) = self.db.list_voices(&model) {
+            for r in rows {
+                if !list.iter().any(|v| v.id == r.id) {
+                    list.push(VoiceEntry {
+                        id: r.id,
+                        note: "clone".into(),
+                        custom: true,
+                    });
+                }
+            }
+            sel = list
+                .iter()
+                .position(|v| v.id == self.tts.current_voice_id)
+                .unwrap_or(sel);
+        }
+        self.voice_list = list;
+        self.voice_selected = sel;
+        self.goto(Screen::Voices);
+    }
+
+    /// Select the highlighted voice. Stops playback (different audio).
+    pub fn select_voice(&mut self) {
+        let Some(entry) = self.voice_list.get(self.voice_selected).cloned() else {
+            return;
+        };
+        self.tts.current_voice_id = entry.id.clone();
+        self.config.tts.voice = entry.id.clone();
+        self.player.stop();
+        self.buffering = false;
+        if self.playback == PlaybackState::Playing {
+            self.playback = PlaybackState::Paused;
+        }
+        self.status_msg = Some(format!("voice → {} (press Space to listen)", entry.id));
+        self.go_back();
+    }
+
+    /// Delete the highlighted voice if it is a user clone.
+    pub fn delete_selected_voice(&mut self) {
+        let Some(entry) = self.voice_list.get(self.voice_selected).cloned() else {
+            return;
+        };
+        if !entry.custom {
+            self.status_msg = Some("built-in voices can't be deleted".into());
+            return;
+        }
+        let _ = self.db.remove_voice(&entry.id);
+        let wav = Config::voices_dir().join(format!("{}.wav", entry.id));
+        let _ = std::fs::remove_file(&wav);
+        let se = Config::voices_dir().join(format!("{}.se.pt", entry.id));
+        let _ = std::fs::remove_file(&se);
+        if self.tts.current_voice_id == entry.id {
+            let def = orpheus_tts::voice_stem_default(&self.tts.current_model_id);
+            self.tts.current_voice_id = def.clone();
+            self.config.tts.voice = def;
+        }
+        self.status_msg = Some(format!("voice '{}' deleted", entry.id));
+        self.open_voices(); // refresh list, stay on screen
+    }
+
+    /// Preview the highlighted voice: synthesize one line and play it now.
+    /// Blocking for a few seconds on first synthesis (worker may load).
+    pub fn preview_selected_voice(&mut self) {
+        let Some(entry) = self.voice_list.get(self.voice_selected).cloned() else {
+            return;
+        };
+        if !self.worker_supported() {
+            self.status_msg = Some(format!(
+                "{} has no voice yet — pick kokoro to preview",
+                self.tts.current_model_id
+            ));
+            return;
+        }
+        if !self.player.available() {
+            self.status_msg = Some("ffplay not found — install ffmpeg".into());
+            return;
+        }
+        const PREVIEW: &str = "The desert was vast and silent. Paul looked toward the horizon.";
+        self.status_msg = Some(format!("previewing '{}'…", entry.id));
+        match self.ensure_audio_for(&self.tts.current_model_id.clone(), &entry.id, PREVIEW) {
+            Ok(path) => {
+                if self.player.play(&path, 1.0).is_ok() {
+                    self.status_msg = Some(format!("previewing '{}'", entry.id));
+                } else {
+                    self.status_msg = Some("preview playback failed".into());
+                }
+            }
+            Err(e) => self.status_msg = Some(format!("preview failed: {e}")),
+        }
+    }
+
+    /// Synthesize arbitrary text with an explicit model+voice (preview path).
+    fn ensure_audio_for(
+        &self,
+        model: &str,
+        voice: &str,
+        text: &str,
+    ) -> std::result::Result<PathBuf, String> {
+        let (_, cands) = worker_cache_candidates(&self.audio_cache_dir, model, voice, text);
+        if let Some(hit) = cands.iter().find(|p| p.is_file()) {
+            return Ok(hit.clone());
+        }
+        let worker = WorkerBackend::new(self.config.tts.worker_url.clone(), model.to_string())
+            .map_err(|e| e.to_string())?;
+        let req = orpheus_tts::SynthesisRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            model: model.to_string(),
+            voice: voice.to_string(),
+            text: text.to_string(),
+            speed: 1.0,
+            out_path: cands[0].clone(),
+        };
+        use orpheus_tts::TTSBackend;
+        self.rt
+            .block_on(worker.synthesize(&req))
+            .map(|r| r.audio_path)
+            .map_err(|e| e.to_string())
+    }
+
+    // --- Add-voice editor ---------------------------------------------------------
+
+    pub fn open_voice_editor(&mut self) {
+        self.ve_name.clear();
+        // Suggest the first sample found in ~/voices to cut typing.
+        self.ve_path = default_sample_hint().unwrap_or_default();
+        self.ve_field = 0;
+        self.goto(Screen::VoiceEditor);
+    }
+
+    /// Fast checks only (name, file exists, source duration): runs on the key
+    /// press and returns instantly. On success the caller stages the save and
+    /// the heavy transcode happens in tick_voice_save, after the UI repaints.
+    pub fn prepare_voice_save(&self) -> std::result::Result<PendingVoiceSave, String> {
+        let name = self.ve_name.trim().to_string();
+        if name.is_empty() {
+            return Err("give the voice a name, then Enter".into());
+        }
+        let src = resolve_sample_path(&self.ve_path)?;
+        let id = slugify(&name);
+        if id.is_empty() {
+            return Err("name must contain letters or digits".into());
+        }
+        // Probe BEFORE transcoding: a 20-minute chapter used to freeze the UI
+        // through a doomed transcode before being rejected.
+        let secs = probe_secs(&src)?;
+        if secs < 3.0 {
+            return Err(format!("sample is {secs:.1}s — need at least 3s of speech"));
+        }
+        if secs > 300.0 {
+            return Err(format!(
+                "sample is {secs:.0}s — cut 15–30s first, e.g. ffmpeg -ss 90 -t 25 -i input.mp3 out.wav"
+            ));
+        }
+        let voices_dir = Config::voices_dir();
+        std::fs::create_dir_all(&voices_dir).map_err(|e| e.to_string())?;
+        Ok(PendingVoiceSave {
+            id,
+            name,
+            src,
+            dest: voices_dir.join(format!("{}.wav", slugify(&self.ve_name))),
+        })
+    }
+
+    /// Heavy half of saving: normalize + register. Called from the tick, so
+    /// the "normalizing…" status is already on screen and keys stay alive
+    /// everywhere else. Esc meanwhile just leaves the editor; the result
+    /// lands (or its error) right after.
+    pub fn tick_voice_save(&mut self) {
+        let Some(pending) = self.pending_voice_save.take() else {
+            return;
+        };
+        if self.screen != Screen::VoiceEditor {
+            return; // user backed out meanwhile; drop it
+        }
+        if let Err(e) = normalize_reference(&pending.src, &pending.dest) {
+            self.status_msg = Some(e);
+            return;
+        }
+        match probe_secs(&pending.dest) {
+            Ok(secs) if secs >= 3.0 => {
+                let model = self.tts.current_model_id.clone();
+                match self.db.add_voice(
+                    &pending.id,
+                    &pending.name,
+                    &model,
+                    &pending.dest.to_string_lossy(),
+                ) {
+                    Ok(()) => {
+                        self.tts.current_voice_id = pending.id.clone();
+                        self.config.tts.voice = pending.id.clone();
+                        self.status_msg = Some(format!(
+                            "voice '{}' added ({secs:.0}s) — p previews",
+                            pending.name
+                        ));
+                        self.open_voices();
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&pending.dest);
+                        self.status_msg = Some(format!("could not save voice: {e}"));
+                    }
+                }
+            }
+            _ => {
+                let _ = std::fs::remove_file(&pending.dest);
+                self.status_msg = Some("transcode produced no usable audio".into());
+            }
+        }
+    }
+
     pub fn goto(&mut self, s: Screen) {
         if self.screen != s {
             self.prev_screen = self.screen;
@@ -175,6 +699,7 @@ impl App {
             Screen::Directory
             | Screen::Models
             | Screen::Voices
+            | Screen::VoiceEditor
             | Screen::Appearance
             | Screen::Help
             | Screen::Search => {
@@ -343,6 +868,7 @@ impl App {
             self.sentence_cursor += 1;
             self.ensure_cursor_visible_chapter();
             self.persist_position();
+            self.restart_audio_if_playing();
         }
     }
 
@@ -351,6 +877,7 @@ impl App {
             self.sentence_cursor -= 1;
             self.ensure_cursor_visible_chapter();
             self.persist_position();
+            self.restart_audio_if_playing();
         }
     }
 
@@ -380,6 +907,7 @@ impl App {
                 // Move to chapter start.
                 self.sentence_cursor = self.chapter_start_global();
                 self.persist_position();
+                self.restart_audio_if_playing();
             }
         }
     }
@@ -391,23 +919,260 @@ impl App {
             self.snap_cursor_to_chapter();
             self.sentence_cursor = self.chapter_start_global();
             self.persist_position();
+            self.restart_audio_if_playing();
         }
     }
 
     pub fn toggle_play(&mut self) {
-        self.playback = match self.playback {
-            PlaybackState::Playing => PlaybackState::Paused,
-            _ => PlaybackState::Playing,
-        };
-        // Real audio queue lands in Milestone 7/8; mock advances highlight.
-        self.status_msg = Some(match self.playback {
-            PlaybackState::Playing => format!(
-                "▶ narrating with {} @ {:.2}x (mock audio until TTS worker lands)",
-                self.tts.current_model_id, self.speed
-            ),
-            PlaybackState::Paused => "⏸ paused".into(),
-            PlaybackState::Stopped => "⏹ stopped".into(),
+        match self.playback {
+            PlaybackState::Playing => {
+                // True pause: freeze mid-sentence, resume continues in place.
+                self.player.pause();
+                self.buffering = false;
+                self.playback = PlaybackState::Paused;
+                self.status_msg = Some("⏸ paused".into());
+            }
+            _ => {
+                if self.book.is_none() {
+                    self.status_msg = Some("no book open".into());
+                    return;
+                }
+                if !self.uses_worker_audio() {
+                    // Mock model: advance the highlight on a timer (no audio).
+                    self.playback = PlaybackState::Playing;
+                    self.status_msg = Some(format!(
+                        "▶ narrating with {} @ {:.2}x (mock audio until worker serves it)",
+                        self.tts.current_model_id, self.speed
+                    ));
+                    return;
+                }
+                if !self.worker_supported() {
+                    // Selected family has no voice worker yet (e.g. chatterbox).
+                    // Say so plainly instead of a misleading restart hint.
+                    self.status_msg = Some(format!(
+                        "{} has no voice yet — press m and pick kokoro to listen",
+                        self.tts.current_model_id
+                    ));
+                    return;
+                }
+                if !self.player.available() {
+                    self.status_msg =
+                        Some("ffplay not found — install ffmpeg for narration audio".into());
+                    return;
+                }
+                // Resume a frozen sentence in place when possible; otherwise
+                // re-buffer from the cursor (non-blocking, tick does the work).
+                if self.player.resume() {
+                    self.playback = PlaybackState::Playing;
+                    self.status_msg = Some("▶ resumed".into());
+                    return;
+                }
+                self.playback = PlaybackState::Playing;
+                self.buffering = true;
+                self.status_msg = Some("▶ buffering…".into());
+            }
+        }
+    }
+
+    // --- Narration (worker audio) --------------------------------------------------
+
+    /// True when the current model should produce real audio via book-tts.
+    pub fn uses_worker_audio(&self) -> bool {
+        match self.tts.current_model() {
+            Some(m) => !matches!(m.backend, BackendKind::Mock),
+            None => false,
+        }
+    }
+
+    /// True when a worker implementation exists for the current family.
+    /// Only Kokoro is served today; others get a plainspoken message
+    /// instead of a synthesis round-trip that can only fail.
+    pub fn worker_supported(&self) -> bool {
+        match self.tts.current_model() {
+            Some(m) => matches!(m.backend, BackendKind::Kokoro),
+            None => false,
+        }
+    }
+
+    /// Speakable (TTS-preprocessed) text at a global sentence index.
+    /// None = artifact (page number etc.), skip it in narration.
+    pub fn narration_text(&self, idx: usize) -> Option<String> {
+        let book = self.book.as_ref()?;
+        let flat = book.flat_sentences();
+        flat.get(idx).and_then(|(_, _, _, s)| {
+            let t = s.speak_text.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    }
+
+    fn cached_audio(&self, text: &str) -> Option<PathBuf> {
+        let (_, cands) = worker_cache_candidates(
+            &self.audio_cache_dir,
+            &self.tts.current_model_id,
+            &self.tts.current_voice_id,
+            text,
+        );
+        cands.into_iter().find(|p| p.is_file())
+    }
+
+    /// Local file for this text: cache hit or worker synthesis (blocking).
+    fn ensure_audio(&self, text: &str) -> std::result::Result<PathBuf, String> {
+        self.ensure_audio_for(
+            &self.tts.current_model_id.clone(),
+            &self.tts.current_voice_id.clone(),
+            text,
+        )
+    }
+
+    fn play_sentence(&mut self, idx: usize) -> std::result::Result<(), String> {
+        let text = self.narration_text(idx).ok_or_else(|| "skip".to_string())?;
+        let path = self.ensure_audio(&text)?;
+        self.player
+            .play(&path, self.speed)
+            .map_err(|e| e.to_string())
+    }
+
+    /// After any cursor move: drop stale audio so a later resume can never
+    /// replay the old sentence. Restart is non-blocking (tick replays when
+    /// still playing); seeks stay responsive even mid-synthesis.
+    pub fn restart_audio_if_playing(&mut self) {
+        if !self.uses_worker_audio() {
+            return;
+        }
+        self.player.stop();
+        if self.playback == PlaybackState::Playing {
+            self.buffering = true;
+        }
+    }
+
+    /// Prefetch the next few sentences in a background thread so continuous
+    /// playback rarely waits on synthesis.
+    pub fn prefetch_ahead(&self) {
+        if !self.uses_worker_audio() || !self.worker_supported() {
+            return;
+        }
+        let Some(book) = &self.book else { return };
+        let total = book.total_sentences();
+        let flat = book.flat_sentences();
+        let mut jobs: Vec<(String, String, String, String)> = Vec::new();
+        for idx in (self.sentence_cursor + 1)..=(self.sentence_cursor + 3).min(total) {
+            let Some((_, _, _, s)) = flat.get(idx) else {
+                continue;
+            };
+            let t = s.speak_text.trim();
+            if t.is_empty() || self.cached_audio(t).is_some() {
+                continue;
+            }
+            jobs.push((
+                self.config.tts.worker_url.clone(),
+                self.tts.current_model_id.clone(),
+                self.tts.current_voice_id.clone(),
+                t.to_string(),
+            ));
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let cache_dir = self.audio_cache_dir.clone();
+        std::thread::spawn(move || {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            use orpheus_tts::TTSBackend;
+            for (url, model, voice, text) in jobs {
+                let Ok(worker) = WorkerBackend::new(url, model.clone()) else {
+                    return;
+                };
+                let (_, cands) = worker_cache_candidates(&cache_dir, &model, &voice, &text);
+                let req = orpheus_tts::SynthesisRequest {
+                    request_id: uuid::Uuid::new_v4().to_string(),
+                    model,
+                    voice,
+                    text,
+                    speed: 1.0,
+                    out_path: cands[0].clone(),
+                };
+                // Best effort: failures surface when the sentence comes up.
+                let _ = rt.block_on(worker.synthesize(&req));
+            }
         });
+    }
+
+    /// Called every UI tick. Advances narration when the current file
+    /// finishes; synthesizes when buffering. Runs on any screen so listening
+    /// continues while browsing (highlight follows on return).
+    pub fn tick_playback(&mut self) {
+        if self.playback != PlaybackState::Playing || self.book.is_none() {
+            return;
+        }
+        if !self.uses_worker_audio() {
+            self.mock_tick += 1;
+            let every = ((8.0 / self.speed).round() as u8).clamp(2, 16);
+            if self.mock_tick >= every {
+                self.mock_tick = 0;
+                if self.sentence_cursor + 1 < self.total_sentences() {
+                    self.next_sentence();
+                } else {
+                    self.playback = PlaybackState::Stopped;
+                    self.status_msg = Some("■ finished".into());
+                }
+            }
+            return;
+        }
+        if self.buffering {
+            match self.play_sentence(self.sentence_cursor) {
+                Ok(()) => {
+                    self.buffering = false;
+                    self.status_msg = Some(format!(
+                        "▶ {} @ {:.2}x",
+                        self.tts.current_voice_id, self.speed
+                    ));
+                    self.prefetch_ahead();
+                }
+                Err(e) if e == "skip" => {
+                    // Junk sentence under cursor: step forward, stay buffering.
+                    if self.sentence_cursor + 1 < self.total_sentences() {
+                        self.sentence_cursor += 1;
+                        self.ensure_cursor_visible_chapter();
+                        self.persist_position();
+                    } else {
+                        self.playback = PlaybackState::Stopped;
+                        self.buffering = false;
+                    }
+                }
+                Err(e) => {
+                    self.playback = PlaybackState::Paused;
+                    self.buffering = false;
+                    self.status_msg = Some(format!("audio: {e}"));
+                }
+            }
+            return;
+        }
+        if self.player.is_playing() {
+            return;
+        }
+        // Current file finished → advance to next speakable sentence.
+        let total = self.total_sentences();
+        let mut next = self.sentence_cursor + 1;
+        while next < total && self.narration_text(next).is_none() {
+            next += 1;
+        }
+        if next < total {
+            self.sentence_cursor = next;
+            self.ensure_cursor_visible_chapter();
+            self.persist_position();
+            self.buffering = true; // tick replays (usually instant cache hit)
+        } else {
+            self.playback = PlaybackState::Stopped;
+            self.status_msg = Some("■ finished".into());
+        }
     }
 
     pub fn set_speed(&mut self, s: f32) {
@@ -429,5 +1194,92 @@ impl App {
             }
             _ => "Esc back · q quit".into(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_store(tag: &str) -> (PathBuf, ModelStore) {
+        let dir = std::env::temp_dir().join(format!("orpheus-voices-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (dir.clone(), ModelStore::new(dir))
+    }
+
+    #[test]
+    fn voice_list_from_store_stems_default_first() {
+        let (_dir, store) = tmp_store("stems");
+        // Fake a pulled kokoro: manifest + voices/*.pt.
+        let manifest = orpheus_tts::ModelManifest::new(
+            "kokoro",
+            "hexgrad/Kokoro-82M",
+            "abc",
+            "kokoro",
+            vec![],
+            0,
+        );
+        store.write_manifest(&manifest).unwrap();
+        let vdir = store.model_dir("kokoro").unwrap().join("voices");
+        std::fs::create_dir_all(&vdir).unwrap();
+        for stem in ["af_heart", "af_bella", "am_adam"] {
+            std::fs::write(vdir.join(format!("{stem}.pt")), b"fake").unwrap();
+        }
+        let (list, sel) = voices_for_model(&store, "kokoro", "af_bella");
+        let ids: Vec<_> = list.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids[0], "kokoro-default");
+        assert!(ids.contains(&"af_heart"));
+        assert!(ids.contains(&"am_adam"));
+        assert_eq!(sel, ids.iter().position(|i| *i == "af_bella").unwrap());
+        assert!(list.iter().all(|v| !v.custom));
+    }
+
+    #[test]
+    fn voice_list_falls_back_to_current() {
+        let (_dir, store) = tmp_store("empty");
+        let (list, sel) = voices_for_model(&store, "mock", "mock-default");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, "mock-default");
+        assert_eq!(sel, 0);
+    }
+
+    #[test]
+    fn gain_targets_minus20_bounded() {
+        assert!((gain_for_mean(-25.7) - 5.7).abs() < 1e-9);
+        assert_eq!(gain_for_mean(-20.0), 0.0);
+        assert_eq!(gain_for_mean(-60.0), 20.0); // floor: don't amplify noise
+        assert_eq!(gain_for_mean(0.0), -10.0); // ceiling on cuts
+    }
+
+    #[test]
+    fn parses_volumedetect_output() {
+        let sample = "[Parsed_volumedetect_0 @ 0x123] mean_volume: -25.7 dB\n\
+                      [Parsed_volumedetect_0 @ 0x123] max_volume: -3.1 dB\n";
+        assert_eq!(parse_mean_volume(sample), Some(-25.7));
+        assert_eq!(parse_mean_volume("mean_volume: -inf dB"), None);
+        assert_eq!(parse_mean_volume("mean_volume: n/a"), None);
+        assert_eq!(parse_mean_volume("no stats here"), None);
+    }
+
+    #[test]
+    fn slugify_names() {
+        assert_eq!(slugify("Sarah the Narrator"), "sarah-the-narrator");
+        assert_eq!(slugify("  Dune!! Voice 2 "), "dune-voice-2");
+        assert_eq!(slugify("!!!"), "");
+    }
+
+    #[test]
+    fn resolve_rejects_missing_and_non_audio() {
+        assert!(resolve_sample_path("").is_err());
+        assert!(resolve_sample_path("definitely-not-here-12345.wav").is_err());
+        let dir = std::env::temp_dir().join(format!("orpheus-voices-txt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("note.txt");
+        std::fs::write(&txt, b"hi").unwrap();
+        assert!(resolve_sample_path(txt.to_str().unwrap()).is_err());
+        let wav = dir.join("sample.wav");
+        std::fs::write(&wav, b"RIFF....").unwrap();
+        assert_eq!(resolve_sample_path(wav.to_str().unwrap()).unwrap(), wav);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

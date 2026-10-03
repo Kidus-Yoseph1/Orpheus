@@ -3,11 +3,18 @@
 //! The reader (orpheus binary) must NEVER match on concrete model names.
 //! It only talks to `TtsManager` / `TTSBackend` via this interface.
 //!
-//! Future backends (Kokoro, Chatterbox, Chatterbox-Turbo, custom HF ids)
-//! implement `TTSBackend` and are registered without touching reader code.
-//!
-//! V1 Milestone 1+2 ships with `MockBackend` only. Real Python worker
-//! integration (Unix socket / HTTP per GUIDE §3) lands in Milestone 5+6.
+//! Model files live in an app-owned store (`store::ModelStore`:
+//! `models/<id>/orpheus-manifest.json` + weights). Downloads are done by
+//! `tts-worker/` straight into the model dir; the reader only reads
+//! manifests.
+
+pub mod store;
+pub mod worker;
+
+pub use store::{ModelManifest, ModelStore};
+pub use worker::{
+    voice_stem, voice_stem_default, worker_cache_candidates, WorkerBackend, WORKER_DEFAULT_URL,
+};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -105,6 +112,14 @@ pub struct TtsModel {
     pub capabilities: TtsCapabilities,
     /// Local path once pulled (None until installed).
     pub local_path: Option<PathBuf>,
+    /// HuggingFace repo to pull from, e.g. "hexgrad/Kokoro-82M".
+    /// None = not yet adopted (refine later).
+    #[serde(default)]
+    pub hf_repo: Option<String>,
+    /// Pinned commit; None = resolve `main` at pull time and record it
+    /// in the store manifest.
+    #[serde(default)]
+    pub revision: Option<String>,
 }
 
 impl TtsModel {
@@ -122,6 +137,8 @@ impl TtsModel {
                 languages: vec!["en".into()],
             },
             local_path: None,
+            hf_repo: None,
+            revision: None,
         }
     }
 
@@ -129,7 +146,7 @@ impl TtsModel {
         vec![
             Self {
                 id: "kokoro".into(),
-                name: "Kokoro (lightweight)".into(),
+                name: "Kokoro-82M (lightweight)".into(),
                 backend: BackendKind::Kokoro,
                 language: "en".into(),
                 installed: false,
@@ -140,6 +157,8 @@ impl TtsModel {
                     languages: vec!["en".into()],
                 },
                 local_path: None,
+                hf_repo: Some("hexgrad/Kokoro-82M".into()),
+                revision: None,
             },
             Self {
                 id: "chatterbox-turbo".into(),
@@ -154,6 +173,9 @@ impl TtsModel {
                     languages: vec!["en".into()],
                 },
                 local_path: None,
+                // TODO: fill repo id when adopted.
+                hf_repo: None,
+                revision: None,
             },
             Self {
                 id: "chatterbox".into(),
@@ -168,6 +190,9 @@ impl TtsModel {
                     languages: vec!["en".into()],
                 },
                 local_path: None,
+                // TODO: fill repo id when adopted.
+                hf_repo: None,
+                revision: None,
             },
             Self::mock(),
         ]
@@ -317,7 +342,9 @@ impl TtsManager {
         } else {
             // Support "type a model name and pull it on the fly":
             // register unknown ids as Custom so UI/worker can install them.
+            // "org/name" ids double as the HF repo to pull.
             let kind = BackendKind::from_id(id);
+            let hf_repo = id.contains('/').then(|| id.to_string());
             let model = TtsModel {
                 id: id.to_string(),
                 name: id.to_string(),
@@ -331,6 +358,8 @@ impl TtsManager {
                     languages: vec!["en".into()],
                 },
                 local_path: None,
+                hf_repo,
+                revision: None,
             };
             self.models.insert(id.to_string(), model);
             self.current_model_id = id.to_string();
@@ -343,6 +372,43 @@ impl TtsManager {
         if let Some(m) = self.models.get_mut(id) {
             m.installed = true;
             m.local_path = Some(path);
+        }
+    }
+
+    /// Reconcile one on-disk manifest (approach B store) into the manager.
+    /// Known ids keep catalog metadata and gain installed/path (+ repo info
+    /// if the catalog didn't pin it yet). Unknown ids become Custom entries
+    /// so previously pulled models survive restarts.
+    pub fn register_installed(&mut self, manifest: &ModelManifest, path: PathBuf) {
+        if let Some(m) = self.models.get_mut(&manifest.id) {
+            m.installed = true;
+            m.local_path = Some(path);
+            if m.hf_repo.is_none() {
+                m.hf_repo = Some(manifest.hf_repo.clone());
+            }
+            if m.revision.is_none() {
+                m.revision = Some(manifest.revision.clone());
+            }
+        } else {
+            self.models.insert(
+                manifest.id.clone(),
+                TtsModel {
+                    id: manifest.id.clone(),
+                    name: manifest.id.clone(),
+                    backend: BackendKind::from_id(&manifest.backend),
+                    language: "en".into(),
+                    installed: true,
+                    capabilities: TtsCapabilities {
+                        voice_cloning: false,
+                        streaming: false,
+                        word_timing: false,
+                        languages: vec!["en".into()],
+                    },
+                    local_path: Some(path),
+                    hf_repo: Some(manifest.hf_repo.clone()),
+                    revision: Some(manifest.revision.clone()),
+                },
+            );
         }
     }
 }
@@ -361,6 +427,7 @@ mod async_trait {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn builtin_catalog_has_light_and_heavy() {
@@ -384,6 +451,44 @@ mod tests {
         m.select_model("hexgrad/Kokoro-82M").unwrap();
         assert_eq!(m.current_model_id, "hexgrad/Kokoro-82M");
         assert!(m.models.contains_key("hexgrad/Kokoro-82M"));
+        // org/name ids double as the pull repo.
+        assert_eq!(
+            m.models["hexgrad/Kokoro-82M"].hf_repo.as_deref(),
+            Some("hexgrad/Kokoro-82M")
+        );
+    }
+
+    #[test]
+    fn kokoro_pins_hf_repo() {
+        let m = TtsManager::new();
+        assert_eq!(
+            m.models["kokoro"].hf_repo.as_deref(),
+            Some("hexgrad/Kokoro-82M")
+        );
+    }
+
+    #[test]
+    fn register_installed_flips_builtin() {
+        let mut m = TtsManager::new();
+        assert!(!m.models["kokoro"].installed);
+        let manifest = ModelManifest::new(
+            "kokoro",
+            "hexgrad/Kokoro-82M",
+            "abc123",
+            "kokoro",
+            vec!["kokoro-v1_0.pth".into()],
+            320_000_000,
+        );
+        m.register_installed(&manifest, PathBuf::from("/data/models/kokoro"));
+        let k = &m.models["kokoro"];
+        assert!(k.installed);
+        assert_eq!(
+            k.local_path.as_deref(),
+            Some(Path::new("/data/models/kokoro"))
+        );
+        assert_eq!(k.revision.as_deref(), Some("abc123"));
+        // Catalog name/capabilities survive reconciliation.
+        assert_eq!(k.name, "Kokoro-82M (lightweight)");
     }
 
     #[tokio::test]

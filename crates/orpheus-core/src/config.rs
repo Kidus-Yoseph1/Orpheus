@@ -98,6 +98,8 @@ pub struct TtsConfig {
     pub device: String,
     #[serde(default = "default_voice")]
     pub voice: String,
+    #[serde(default = "default_worker_url")]
+    pub worker_url: String,
     #[serde(default)]
     pub gpu: GpuConfig,
 }
@@ -111,6 +113,9 @@ fn default_device() -> String {
 fn default_voice() -> String {
     "kokoro-default".into()
 }
+fn default_worker_url() -> String {
+    "http://127.0.0.1:8765".into()
+}
 
 impl Default for TtsConfig {
     fn default() -> Self {
@@ -118,6 +123,7 @@ impl Default for TtsConfig {
             model: default_model(),
             device: default_device(),
             voice: default_voice(),
+            worker_url: default_worker_url(),
             gpu: GpuConfig::default(),
         }
     }
@@ -219,5 +225,15 @@ impl Config {
 
     pub fn db_path() -> PathBuf {
         Self::data_dir().join("library.db")
+    }
+
+    pub fn audio_cache_dir() -> PathBuf {
+        Self::data_dir().join("cache").join("audio")
+    }
+
+    /// Normalized user voice references: `<data>/voices/<id>.wav`.
+    /// The worker is started with the same dir (`--voices-dir`).
+    pub fn voices_dir() -> PathBuf {
+        Self::data_dir().join("voices")
     }
 }
