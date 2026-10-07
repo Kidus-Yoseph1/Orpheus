@@ -194,6 +194,9 @@ class KokoroEngine:
                 return ("clone", p)
         raise ValueError(f"unknown voice: {voice!r}")
 
+    def is_loaded(self) -> bool:
+        return self.pipe is not None
+
     def ensure_loaded(self):
         if self.pipe is not None:
             return
@@ -363,6 +366,123 @@ class KokoroEngine:
             return array.array("h", pcm.tolist()).tobytes()
 
 
+class ChatterboxTurboEngine:
+    """Chatterbox Turbo: native zero-shot voice cloning (better fidelity than
+    Kokoro+OpenVoice conversion, ~2.8 GB VRAM measured, ~32s cold load).
+
+    Turbo ships no preset voices — every voice IS a reference clip, so the
+    voice list is exactly the clones in `voices_dir`. Uses `from_local`
+    against the app-owned store; the HF cache is never touched.
+    """
+
+    # Chatterbox asserts prompts longer than this; 10–30s is the sweet spot.
+    MIN_REF_SECS = 6.0
+
+    def __init__(self, model_id: str, model_dir: Path, device: str,
+                 voices_dir: Path, ov_model_dir: Path):
+        self.model_id = model_id
+        self.model_dir = model_dir
+        self.voices_dir = voices_dir
+        self.want_device = device
+        self.device = "cpu"
+        self.model = None
+        self.lock = threading.Lock()
+        self._prepared: set[str] = set()  # refs whose conditionals are loaded
+        manifest = json.loads((model_dir / MANIFEST_FILE).read_text())
+        self.revision = manifest.get("revision", "")
+
+    def voices(self) -> list[dict]:
+        out = []
+        if self.voices_dir.is_dir():
+            for p in sorted(self.voices_dir.glob("*.wav")):
+                if CLONE_RE.match(p.stem):
+                    out.append({"id": p.stem, "name": f"{p.stem} (clone)"})
+        return out
+
+    def resolve_voice(self, voice: str) -> tuple[str, Path]:
+        if CLONE_RE.match(voice or ""):
+            p = self.voices_dir / f"{voice}.wav"
+            if p.is_file():
+                secs = probe_duration(p)
+                if secs and secs < self.MIN_REF_SECS:
+                    raise ValueError(
+                        f"voice '{voice}' sample is {secs:.0f}s — chatterbox needs "
+                        f"{self.MIN_REF_SECS:.0f}s+ of clean speech"
+                    )
+                return ("chatterbox", p)
+        raise ValueError(
+            f"chatterbox has no built-in voices: add a sample in Orpheus (v → a) "
+            f"first, then select it"
+        )
+
+    def is_loaded(self) -> bool:
+        return self.model is not None
+
+    def ensure_loaded(self):
+        if self.model is not None:
+            return
+        import torch
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
+
+        want = self.want_device
+        if want == "auto":
+            want = "cuda" if torch.cuda.is_available() else "cpu"
+        required = ["t3_turbo_v1.safetensors", "ve.safetensors", "conds.pt"]
+        missing = [f for f in required if not (self.model_dir / f).is_file()]
+        if missing:
+            raise RuntimeError(f"chatterbox files missing in {self.model_dir}: {missing}")
+        try:
+            self.model = ChatterboxTurboTTS.from_local(str(self.model_dir), device=want)
+        except Exception as e:
+            if want == "cuda":
+                log(f"cuda load failed ({e}); falling back to cpu")
+                want = "cpu"
+                self.model = ChatterboxTurboTTS.from_local(str(self.model_dir), device=want)
+            else:
+                raise
+        self.device = want
+        log(f"loaded {self.model_id} on {want} "
+            f"({round(torch.cuda.memory_allocated()/1e6)} MB)")
+
+    def unload(self):
+        import torch
+
+        self.model = None
+        self._prepared.clear()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        self.device = "cpu"
+        log(f"unloaded {self.model_id}")
+
+    def synthesize(self, text: str, voice: tuple[str, Path]) -> tuple[bytes, float]:
+        import torch
+
+        _kind, vpath = voice
+        clean = " ".join(text.split())
+        if not clean:
+            raise ValueError("empty text")
+        if len(clean) > 2000:
+            clean = clean[:2000]
+        with self.lock:
+            self.ensure_loaded()
+            assert self.model is not None
+            with torch.no_grad():
+                wav = self.model.generate(clean, audio_prompt_path=str(vpath))
+            t = torch.as_tensor(wav).detach().cpu().float().reshape(-1)
+            if t.numel() < 128:
+                raise RuntimeError(f"chatterbox returned no audio ({t.numel()} samples)")
+            pcm = (t.clamp(-1.0, 1.0) * 32767.0).to(torch.int16)
+            return KokoroEngine._to_pcm_raw(pcm), len(pcm) / SAMPLE_RATE
+
+
+def build_engine(args, model_dir: Path, voices_dir: Path, ov_dir: Path):
+    """Pick the engine family by model id. One process serves one model."""
+    mid = args.model.lower()
+    if "chatterbox" in mid:
+        return ChatterboxTurboEngine(args.model, model_dir, args.device, voices_dir, ov_dir)
+    return KokoroEngine(args.model, model_dir, args.device, voices_dir, ov_dir)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "book-tts/0.1"
 
@@ -390,13 +510,13 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        eng: KokoroEngine = self.server.engine  # type: ignore[attr-defined]
+        eng = self.server.engine  # type: ignore[attr-defined]
         path = urlparse(self.path).path
         if path == "/health":
             self._send(200, {
                 "ok": True,
                 "model": eng.model_id,
-                "loaded": eng.pipe is not None,
+                "loaded": eng.is_loaded(),
                 "device": eng.device,
                 "revision": eng.revision,
             })
@@ -406,7 +526,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "unknown route"})
 
     def do_POST(self):
-        eng: KokoroEngine = self.server.engine  # type: ignore[attr-defined]
+        eng = self.server.engine  # type: ignore[attr-defined]
         cache_dir: Path = self.server.cache_dir  # type: ignore[attr-defined]
         path = urlparse(self.path).path
         if path == "/unload":
@@ -517,10 +637,9 @@ def main() -> None:
             f"pull first: python download.py --id {args.model} "
             f"--repo <org/name> --backend kokoro"
         )
-    engine = KokoroEngine(
-        args.model,
+    engine = build_engine(
+        args,
         model_dir,
-        args.device,
         Path(args.voices_dir),
         Path(args.models_dir) / args.ov_model,
     )

@@ -2,6 +2,7 @@ mod app;
 mod audio;
 mod cli;
 mod ui;
+mod worker_ctl;
 
 use std::io::stdout;
 use std::path::PathBuf;
@@ -54,6 +55,10 @@ fn main() -> Result<()> {
     app.speed = app.config.playback.speed;
     app.refresh_recent();
 
+    if cli.worker_check {
+        return worker_check(&mut app);
+    }
+
     // CLI routing (GUIDE §29).
     if let Some(cmd) = &cli.command {
         match cmd {
@@ -81,6 +86,8 @@ fn main() -> Result<()> {
     }
 
     run_tui(&mut app)?;
+    // Shut the worker down with the reader (it holds VRAM).
+    app.worker.stop();
     // Persist on exit.
     app.persist_position();
     app.config.reader.theme = app.theme.name.clone();
@@ -89,6 +96,51 @@ fn main() -> Result<()> {
     app.config.tts.model = app.tts.current_model_id.clone();
     app.config.tts.voice = app.tts.current_voice_id.clone();
     let _ = app.config.save();
+    Ok(())
+}
+
+/// Non-interactive verification: spawn the worker for the selected model and
+/// report readiness. Mirrors exactly what the reader does on first play.
+fn worker_check(app: &mut App) -> Result<()> {
+    let model = app.tts.current_model_id.clone();
+    if !app.worker_supported() {
+        println!("✗ {model}: no worker backend yet (kokoro / chatterbox-turbo supported)");
+        return Ok(());
+    }
+    println!("→ starting book-tts for {model} …");
+    worker_ctl::supervise(app);
+    if app.worker.running_model.is_none() {
+        println!(
+            "✗ could not spawn worker: {}",
+            app.worker.last_error.clone().unwrap_or_default()
+        );
+        return Ok(());
+    }
+    // Poll health like the UI tick does.
+    use orpheus_tts::TTSBackend;
+    let worker = orpheus_tts::WorkerBackend::new(app.config.tts.worker_url.clone(), model.clone())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let mut ok = false;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let up = app.rt.block_on(worker.health()).unwrap_or(false);
+        if app.worker.is_running() && up {
+            ok = true;
+            break;
+        }
+    }
+    if ok {
+        println!("✓ worker ready on {}", app.config.tts.worker_url);
+        match app.rt.block_on(worker.list_voices()) {
+            Ok(v) => println!("  voices: {}", v.len()),
+            Err(e) => println!("  (voice list unavailable: {e})"),
+        }
+        app.worker.stop();
+        println!("  worker stopped (freeing VRAM)");
+    } else {
+        println!("✗ worker did not become ready (missing model or env?)");
+        app.worker.stop();
+    }
     Ok(())
 }
 
@@ -141,7 +193,12 @@ fn on_tick(app: &mut App) {
     // Voice-save transcode runs here (not on the key press) so its
     // "normalizing…" message paints first and keys never freeze.
     app.tick_voice_save();
-    app.tick_playback();
+    // Keep exactly one worker alive, serving the selected model.
+    worker_ctl::supervise(app);
+    // Don't try to play audio while the worker is still loading.
+    if !app.worker_waiting {
+        app.tick_playback();
+    }
 }
 
 fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
@@ -391,6 +448,9 @@ fn models_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
                 // Different engine, different audio: stop, press Space to start.
                 app.player.stop();
                 app.buffering = false;
+                // Model switch frees/reloads VRAM: the supervisor handles it
+                // on the next tick (kill old worker, spawn for the new model).
+                app.worker_waiting = false;
                 if app.playback == PlaybackState::Playing {
                     app.playback = PlaybackState::Paused;
                 }

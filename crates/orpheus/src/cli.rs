@@ -26,6 +26,11 @@ pub struct Cli {
     #[arg(long)]
     pub model: Option<String>,
 
+    /// Start the TTS worker for the selected model, wait until it answers,
+    /// print its status, then exit (setup check).
+    #[arg(long)]
+    pub worker_check: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }

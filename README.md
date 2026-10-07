@@ -59,6 +59,8 @@ orpheus --theme paper             # start with a theme
 orpheus --style minimal           # start with a reader style
 orpheus --model kokoro            # start with a TTS model
 orpheus --voice kokoro-default    # start with a voice
+orpheus --model chatterbox-turbo  # switch to native-cloning engine
+orpheus --worker-check            # verify the TTS worker starts + loads
 orpheus "book.epub" --theme sepia --model chatterbox-turbo
 
 orpheus voices                    # open the voice manager
@@ -162,6 +164,7 @@ buffer_seconds = 90
 [tts]
 model = "kokoro"
 voice = "kokoro-default"   # kokoro-default (= af_heart) or af_bella, am_adam, ...
+manage_worker = true      # Orpheus spawns/kills book-tts per model (4 GB cards)
 device = "auto"            # auto | cpu | cuda (worker-side, Kokoro only for now)
 worker_url = "http://127.0.0.1:8765"
 
@@ -208,11 +211,23 @@ branches on model names, so backends are swappable.
 
 | Model | Class | Notes |
 | ----- | ----- | ----- |
-| `kokoro` | light | Kokoro-82M, local worker, CPU/GPU |
-| `chatterbox-turbo` | medium | voice cloning (worker support TBD) |
-| `chatterbox` | heavy | voice cloning (worker support TBD) |
+| `kokoro` | light | Kokoro-82M, local worker, CPU/GPU, ~1.4 GB VRAM, ~1.4s/sentence |
+| `chatterbox-turbo` | heavy | native zero-shot cloning, ~2.8 GB VRAM (measured), 32s cold load |
+| `chatterbox` | heavy | not wired yet (same engine, slower) |
 | any custom id | medium | type it in Models (`/`) — registered immediately |
 | `mock` | — | highlight-only timer, no audio (UI exercise) |
+
+**Cloning, two ways:**
+- `kokoro` + a clone = Kokoro renders, OpenVoice V2 converter swaps the timbre
+  (≈1.7 GB VRAM total, latency ~1.4s/sentence)
+- `chatterbox-turbo` clones natively from the reference clip — deeper speaker
+  match, no conversion stage, but heavier and needs a ≥6s sample
+
+**One model at a time.** Two models don't fit in 4 GB of VRAM, so Orpheus
+supervises the worker: switching models kills the old worker (freeing VRAM)
+and spawns one for the new model, polling until it answers `⏳` then plays.
+Set `[tts] manage_worker = false` if you'd rather run the worker yourself
+(`tts-worker/.venv312/bin/python tts-worker/server.py --model kokoro --preload`).
 
 ### 1. Pull the models (explicit, once)
 
@@ -220,6 +235,8 @@ branches on model names, so backends are swappable.
 cd tts-worker
 python3 download.py --id kokoro --repo hexgrad/Kokoro-82M --backend kokoro
 python3 download.py --id openvoice-v2 --repo myshell-ai/OpenVoiceV2 --backend openvoice
+# optional, native cloning instead of conversion (~2.8 GB VRAM, 4 GB download)
+python3 download.py --id chatterbox-turbo --repo ResembleAI/chatterbox-turbo --backend chatterbox-turbo
 # --dry-run to preview, --rev <commit> to pin, --help for all flags
 ```
 
@@ -249,15 +266,19 @@ in background, speed via `ffplay atempo` without re-rendering. Seeks and
 chapter jumps restart instantly; synthesis happens off the key path so the
 UI never freezes — first play shows `▶ buffering…` while Kokoro loads.
 
-### 4. Clone a narrator (Kokoro VRAM + cloning)
+### 4. Clone a narrator
 
-No Chatterbox needed: Kokoro renders, OpenVoice converts timbre (~1.7 GB
+**With kokoro** (default): Kokoro renders, OpenVoice converts timbre (~1.7 GB
 total — measured). Get a 10–30s clean single-speaker clip (LibriVox
 volunteers are ideal: public domain books *and* voices):
 
 ```sh
 ffmpeg -ss 90 -t 20 -i chapter03.mp3 -ar 24000 -ac 1 ~/voices/narrator.wav
 ```
+
+Or **with chatterbox-turbo** (`m` → select it): cloning is native, no
+conversion step, but it wants a ≥6s sample (10–30s ideal) and costs ~2.8 GB
+VRAM with a 32s cold load.
 
 Then in Orpheus: `v` → `a` → name it + point at the file → `Enter` saves
 (a normalized copy lands in `~/.local/share/orpheus/voices/`, original

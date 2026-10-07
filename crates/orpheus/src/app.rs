@@ -82,6 +82,10 @@ pub struct App {
     pub audio_cache_dir: PathBuf,
     pub buffering: bool,
     pub mock_tick: u8,
+    /// book-tts process supervision (spawn/kill per model).
+    pub worker: crate::worker_ctl::WorkerHandle,
+    /// Worker spawned but not yet answering /health (model still loading).
+    pub worker_waiting: bool,
 
     // Voices screen
     pub model_store: ModelStore,
@@ -147,14 +151,13 @@ pub fn voices_for_model(
             }
         }
     }
-    if ids.is_empty() {
-        // Nothing pulled (mock, chatterbox…): offer the current voice only.
-        ids.push(if current_voice.is_empty() {
-            orpheus_tts::voice_stem_default(model_id)
-        } else {
-            current_voice.to_string()
-        });
+    if ids.is_empty() && current_voice.is_empty() {
+        // No store voices and nothing selected (e.g. mock): show a placeholder
+        // so the list isn't mysteriously empty.
+        ids.push(orpheus_tts::voice_stem_default(model_id));
     } else if !current_voice.is_empty() && !ids.contains(&current_voice.to_string()) {
+        // Always keep the selected voice visible, even if it is a clone and
+        // the model ships no built-in stems (chatterbox).
         ids.push(current_voice.to_string());
     }
     let def = orpheus_tts::voice_stem_default(model_id);
@@ -395,6 +398,8 @@ impl App {
             audio_cache_dir: Config::audio_cache_dir(),
             buffering: false,
             mock_tick: 0,
+            worker: Default::default(),
+            worker_waiting: false,
             model_store: ModelStore::new(Config::data_dir().join("models")),
             voice_list: Vec::new(),
             voice_selected: 0,
@@ -614,8 +619,12 @@ impl App {
         // Probe BEFORE transcoding: a 20-minute chapter used to freeze the UI
         // through a doomed transcode before being rejected.
         let secs = probe_secs(&src)?;
-        if secs < 3.0 {
-            return Err(format!("sample is {secs:.1}s — need at least 3s of speech"));
+        let min = self.min_sample_secs();
+        if secs < min {
+            return Err(format!(
+                "sample is {secs:.1}s — {} needs {min:.0}s+ of speech",
+                self.tts.current_model_id
+            ));
         }
         if secs > 300.0 {
             return Err(format!(
@@ -985,13 +994,32 @@ impl App {
     }
 
     /// True when a worker implementation exists for the current family.
-    /// Only Kokoro is served today; others get a plainspoken message
-    /// instead of a synthesis round-trip that can only fail.
     pub fn worker_supported(&self) -> bool {
         match self.tts.current_model() {
-            Some(m) => matches!(m.backend, BackendKind::Kokoro),
+            Some(m) => matches!(
+                m.backend,
+                BackendKind::Kokoro | BackendKind::ChatterboxTurbo
+            ),
             None => false,
         }
+    }
+
+    /// Minimum reference-clip length this model's cloning accepts.
+    /// Kokoro/OpenVoice tolerate short clips; Chatterbox asserts >=5s.
+    pub fn min_sample_secs(&self) -> f64 {
+        match self.tts.current_model().map(|m| m.backend.clone()) {
+            Some(BackendKind::ChatterboxTurbo) => 6.0,
+            _ => 3.0,
+        }
+    }
+
+    /// Does the current model clone natively (no OpenVoice conversion stage)?
+    #[allow(dead_code)]
+    pub fn model_clones_natively(&self) -> bool {
+        matches!(
+            self.tts.current_model().map(|m| m.backend.clone()),
+            Some(BackendKind::ChatterboxTurbo)
+        )
     }
 
     /// Speakable (TTS-preprocessed) text at a global sentence index.

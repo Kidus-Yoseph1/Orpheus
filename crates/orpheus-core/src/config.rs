@@ -100,6 +100,10 @@ pub struct TtsConfig {
     pub voice: String,
     #[serde(default = "default_worker_url")]
     pub worker_url: String,
+    /// Orpheus supervises the worker process (spawn/kill per model) because
+    /// two models cannot stay resident on a 4 GB card.
+    #[serde(default = "default_true")]
+    pub manage_worker: bool,
     #[serde(default)]
     pub gpu: GpuConfig,
 }
@@ -124,6 +128,7 @@ impl Default for TtsConfig {
             device: default_device(),
             voice: default_voice(),
             worker_url: default_worker_url(),
+            manage_worker: true,
             gpu: GpuConfig::default(),
         }
     }
