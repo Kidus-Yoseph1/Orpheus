@@ -1,0 +1,22 @@
+[package]
+name = "orpheus-gui"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native GUI reader for Orpheus (egui), reusing orpheus-core and orpheus-tts"
+
+[dependencies]
+orpheus-core = { path = "../orpheus-core" }
+orpheus-tts = { path = "../orpheus-tts" }
+anyhow.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.36.2", default-features = false, features = ["glow", "wayland", "x11", "default_fonts", "accesskit"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
