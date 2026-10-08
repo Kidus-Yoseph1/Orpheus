@@ -86,6 +86,12 @@ pub struct App {
     pub worker: crate::worker_ctl::WorkerHandle,
     /// Worker spawned but not yet answering /health (model still loading).
     pub worker_waiting: bool,
+    /// When the current worker spawn happened (load timeout budget).
+    pub worker_load_started: std::time::Instant,
+    pub worker_paths: crate::worker_ctl::WorkerPaths,
+    /// Sample length per reference path, keyed by (path, mtime): ffprobe is
+    /// ~30ms and the picker lists every clone, so probe once per file.
+    voice_dur_cache: std::collections::HashMap<String, (std::time::SystemTime, f64)>,
 
     // Voices screen
     pub model_store: ModelStore,
@@ -400,6 +406,14 @@ impl App {
             mock_tick: 0,
             worker: Default::default(),
             worker_waiting: false,
+            worker_load_started: std::time::Instant::now(),
+            voice_dur_cache: std::collections::HashMap::new(),
+            worker_paths: crate::worker_ctl::WorkerPaths {
+                script: (!config.tts.worker_script.is_empty())
+                    .then(|| std::path::PathBuf::from(config.tts.worker_script.clone())),
+                python: (!config.tts.worker_python.is_empty())
+                    .then(|| std::path::PathBuf::from(config.tts.worker_python.clone())),
+            },
             model_store: ModelStore::new(Config::data_dir().join("models")),
             voice_list: Vec::new(),
             voice_selected: 0,
@@ -473,23 +487,34 @@ impl App {
     /// Open the picker: built-ins from the store + cloned voices from SQLite.
     pub fn open_voices(&mut self) {
         let model = self.tts.current_model_id.clone();
-        let (mut list, mut sel) =
-            voices_for_model(&self.model_store, &model, &self.tts.current_voice_id);
-        if let Ok(rows) = self.db.list_voices(&model) {
-            for r in rows {
-                if !list.iter().any(|v| v.id == r.id) {
-                    list.push(VoiceEntry {
-                        id: r.id,
-                        note: "clone".into(),
-                        custom: true,
-                    });
-                }
+        let clones = self.usable_clones(&model);
+        // Clone-only models have no presets: listing the fake `<id>-default`
+        // would offer a voice the worker rejects.
+        let mut list = if self.model_clones_natively(&model) {
+            Vec::new()
+        } else {
+            voices_for_model(&self.model_store, &model, &self.tts.current_voice_id).0
+        };
+        for r in clones {
+            if !list.iter().any(|v| v.id == r.id) {
+                list.push(VoiceEntry {
+                    id: r.id,
+                    note: "clone".into(),
+                    custom: true,
+                });
             }
-            sel = list
-                .iter()
-                .position(|v| v.id == self.tts.current_voice_id)
-                .unwrap_or(sel);
         }
+        if list.is_empty() {
+            list.push(VoiceEntry {
+                id: String::new(),
+                note: "no sample yet — press a to add one".into(),
+                custom: false,
+            });
+        }
+        let sel = list
+            .iter()
+            .position(|v| v.id == self.tts.current_voice_id)
+            .unwrap_or(0);
         self.voice_list = list;
         self.voice_selected = sel;
         self.goto(Screen::Voices);
@@ -500,6 +525,11 @@ impl App {
         let Some(entry) = self.voice_list.get(self.voice_selected).cloned() else {
             return;
         };
+        if entry.id.is_empty() {
+            // Placeholder row on a clone-only model: nothing to select.
+            self.status_msg = Some("add a 6s+ sample first: press a".into());
+            return;
+        }
         self.tts.current_voice_id = entry.id.clone();
         self.config.tts.voice = entry.id.clone();
         self.player.stop();
@@ -521,6 +551,7 @@ impl App {
             return;
         }
         let _ = self.db.remove_voice(&entry.id);
+        self.voice_dur_cache.clear();
         let wav = Config::voices_dir().join(format!("{}.wav", entry.id));
         let _ = std::fs::remove_file(&wav);
         let se = Config::voices_dir().join(format!("{}.se.pt", entry.id));
@@ -540,6 +571,10 @@ impl App {
         let Some(entry) = self.voice_list.get(self.voice_selected).cloned() else {
             return;
         };
+        if entry.id.is_empty() {
+            self.status_msg = Some("add a 6s+ sample first: press a".into());
+            return;
+        }
         if !self.worker_supported() {
             self.status_msg = Some(format!(
                 "{} has no voice yet — pick kokoro to preview",
@@ -666,6 +701,7 @@ impl App {
                     &pending.dest.to_string_lossy(),
                 ) {
                     Ok(()) => {
+                        self.voice_dur_cache.clear();
                         self.tts.current_voice_id = pending.id.clone();
                         self.config.tts.voice = pending.id.clone();
                         self.status_msg = Some(format!(
@@ -1007,19 +1043,106 @@ impl App {
     /// Minimum reference-clip length this model's cloning accepts.
     /// Kokoro/OpenVoice tolerate short clips; Chatterbox asserts >=5s.
     pub fn min_sample_secs(&self) -> f64 {
-        match self.tts.current_model().map(|m| m.backend.clone()) {
-            Some(BackendKind::ChatterboxTurbo) => 6.0,
+        self.min_sample_secs_for(&self.tts.current_model_id.clone())
+    }
+
+    pub fn min_sample_secs_for(&self, model_id: &str) -> f64 {
+        match self
+            .tts
+            .list_models()
+            .into_iter()
+            .find(|m| m.id == model_id)
+        {
+            Some(m) if matches!(m.backend, BackendKind::ChatterboxTurbo) => 6.0,
             _ => 3.0,
         }
     }
 
-    /// Does the current model clone natively (no OpenVoice conversion stage)?
-    #[allow(dead_code)]
-    pub fn model_clones_natively(&self) -> bool {
-        matches!(
-            self.tts.current_model().map(|m| m.backend.clone()),
-            Some(BackendKind::ChatterboxTurbo)
-        )
+    /// Clones this model can actually use: any registered sample (they are
+    /// model-agnostic files) that exists and meets the model's minimum
+    /// length. Too-short or missing samples are dropped instead of being
+    /// offered and failing on every sentence.
+    pub fn usable_clones(&mut self, model_id: &str) -> Vec<orpheus_core::VoiceRow> {
+        let min = self.min_sample_secs_for(model_id);
+        let mut rows = self.db.list_all_voices().unwrap_or_default();
+        rows.retain(|r| {
+            self.sample_secs(&r.reference_path)
+                .map(|d| d + 0.01 >= min)
+                .unwrap_or(false)
+        });
+        rows
+    }
+
+    /// Duration of a sample, cached until the file changes.
+    fn sample_secs(&mut self, path: &str) -> Option<f64> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta.modified().ok()?;
+        if let Some((t, secs)) = self.voice_dur_cache.get(path) {
+            if *t == mtime {
+                return Some(*secs);
+            }
+        }
+        let secs = probe_secs(&std::path::PathBuf::from(path)).ok()?;
+        self.voice_dur_cache.insert(path.to_string(), (mtime, secs));
+        Some(secs)
+    }
+
+    /// Does this model clone natively (no OpenVoice conversion stage)?
+    /// Such models ship **no** built-in voices: `<id>-default` is meaningless
+    /// and the worker rejects it, so the UI must always offer a real clone.
+    pub fn model_clones_natively(&self, model_id: &str) -> bool {
+        self.tts
+            .list_models()
+            .into_iter()
+            .find(|m| m.id == model_id)
+            .map(|m| matches!(m.backend, BackendKind::ChatterboxTurbo))
+            .unwrap_or(false)
+    }
+
+    /// Voice to select for `model_id`: a preset when the model has one,
+    /// otherwise the first registered clone (clone-only models), otherwise a
+    /// placeholder the worker will explain how to fix.
+    pub fn first_voice_for(&mut self, model_id: &str) -> String {
+        if !self.model_clones_natively(model_id) {
+            return orpheus_tts::voice_stem_default(model_id);
+        }
+        self.usable_clones(model_id)
+            .into_iter()
+            .map(|r| r.id)
+            .next()
+            .unwrap_or_else(|| orpheus_tts::voice_stem_default(model_id))
+    }
+
+    /// After a model switch (and at startup): guarantee the selected voice is
+    /// one this model can actually render. Clone-only models reject
+    /// `<id>-default`, which is exactly "model loads but never speaks".
+    pub fn normalize_voice(&mut self) {
+        let model = self.tts.current_model_id.clone();
+        let voice = self.tts.current_voice_id.clone();
+        if voice.is_empty() {
+            let v = self.first_voice_for(&model);
+            self.tts.current_voice_id = v;
+            return;
+        }
+        if !self.model_clones_natively(&model) {
+            return;
+        }
+        let known = self
+            .usable_clones(&model)
+            .into_iter()
+            .any(|r| r.id == voice);
+        if !known {
+            let fallback = self.first_voice_for(&model);
+            if fallback == voice {
+                // No clone registered yet: keep it, the worker's error text
+                // tells the user how to add one.
+                self.status_msg =
+                    Some("chatterbox needs a clone: press v then a to add a 6s+ sample".into());
+            } else {
+                self.tts.current_voice_id = fallback.clone();
+                self.status_msg = Some(format!("voice → {fallback} (model has no built-ins)"));
+            }
+        }
     }
 
     /// Speakable (TTS-preprocessed) text at a global sentence index.

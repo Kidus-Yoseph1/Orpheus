@@ -60,7 +60,7 @@ orpheus --style minimal           # start with a reader style
 orpheus --model kokoro            # start with a TTS model
 orpheus --voice kokoro-default    # start with a voice
 orpheus --model chatterbox-turbo  # switch to native-cloning engine
-orpheus --worker-check            # verify the TTS worker starts + loads
+orpheus --worker-check            # spawn worker, synthesize a test line, exit
 orpheus "book.epub" --theme sepia --model chatterbox-turbo
 
 orpheus voices                    # open the voice manager
@@ -165,6 +165,8 @@ buffer_seconds = 90
 model = "kokoro"
 voice = "kokoro-default"   # kokoro-default (= af_heart) or af_bella, am_adam, ...
 manage_worker = true      # Orpheus spawns/kills book-tts per model (4 GB cards)
+worker_script = ""        # path to tts-worker/server.py ("" = autodetect)
+worker_python = ""        # interpreter for it ("" = repo venv, then python3)
 device = "auto"            # auto | cpu | cuda (worker-side, Kokoro only for now)
 worker_url = "http://127.0.0.1:8765"
 
@@ -226,6 +228,11 @@ branches on model names, so backends are swappable.
 **One model at a time.** Two models don't fit in 4 GB of VRAM, so Orpheus
 supervises the worker: switching models kills the old worker (freeing VRAM)
 and spawns one for the new model, polling until it answers `⏳` then plays.
+The worker is located by walking up from the current directory (and from the
+binary, so `cargo run` works). Launching the *installed* binary from somewhere
+outside the checkout? Set `worker_script` / `worker_python` in `[tts]`, or
+`ORPHEUS_WORKER_SCRIPT`. Logs: `~/.local/share/orpheus/logs/worker-<model>.log`.
+
 Set `[tts] manage_worker = false` if you'd rather run the worker yourself
 (`tts-worker/.venv312/bin/python tts-worker/server.py --model kokoro --preload`).
 

@@ -52,6 +52,9 @@ fn main() -> Result<()> {
         .select_model(&app.config.tts.model.clone())
         .unwrap_or(());
     app.tts.current_voice_id = app.config.tts.voice.clone();
+    // Config may carry a voice the selected model can't render (e.g. a kokoro
+    // preset with chatterbox-turbo): fall back before anything plays.
+    app.normalize_voice();
     app.speed = app.config.playback.speed;
     app.refresh_recent();
 
@@ -107,7 +110,9 @@ fn worker_check(app: &mut App) -> Result<()> {
         println!("✗ {model}: no worker backend yet (kokoro / chatterbox-turbo supported)");
         return Ok(());
     }
-    println!("→ starting book-tts for {model} …");
+    app.normalize_voice();
+    let voice = app.tts.current_voice_id.clone();
+    println!("→ starting book-tts for {model} (voice: {voice}) …");
     worker_ctl::supervise(app);
     if app.worker.running_model.is_none() {
         println!(
@@ -134,6 +139,27 @@ fn worker_check(app: &mut App) -> Result<()> {
         match app.rt.block_on(worker.list_voices()) {
             Ok(v) => println!("  voices: {}", v.len()),
             Err(e) => println!("  (voice list unavailable: {e})"),
+        }
+        // End-to-end: synthesize with the exact voice the reader would use.
+        let req = orpheus_tts::SynthesisRequest {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            model: model.clone(),
+            voice: voice.clone(),
+            text: "The wind moved across the open desert.".into(),
+            speed: 1.0,
+            out_path: app.audio_cache_dir.join("worker-check.opus"),
+        };
+        match app.rt.block_on(worker.synthesize(&req)) {
+            Ok(r) => println!(
+                "  synthesis ✓ {:.2}s → {}",
+                r.duration_secs,
+                r.audio_path.display()
+            ),
+            Err(e) => {
+                println!("  synthesis ✗ {e}");
+                app.worker.stop();
+                return Ok(());
+            }
         }
         app.worker.stop();
         println!("  worker stopped (freeing VRAM)");
@@ -444,7 +470,8 @@ fn models_key(app: &mut App, code: KeyCode, _mods: KeyModifiers) {
             if let Some(m) = models.get(app.model_selected) {
                 let id = m.id.clone();
                 let _ = app.tts.select_model(&id);
-                app.tts.current_voice_id = format!("{id}-default");
+                // Clone-only models have no `<id>-default`: pick a real voice.
+                app.normalize_voice();
                 // Different engine, different audio: stop, press Space to start.
                 app.player.stop();
                 app.buffering = false;

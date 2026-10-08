@@ -320,6 +320,26 @@ impl LibraryDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Every registered reference clip, regardless of model. A sample is a
+    /// wav on disk — it is usable by any engine (kokoro via OpenVoice,
+    /// chatterbox natively), so voices must not be locked to one model.
+    pub fn list_all_voices(&self) -> Result<Vec<VoiceRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, model_id, reference_path, created_at
+             FROM voices ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(VoiceRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                model_id: r.get(2)?,
+                reference_path: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn remove_voice(&self, id: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM voices WHERE id=?1", params![id])?;
@@ -344,6 +364,21 @@ mod tests {
         assert_eq!(recent[0].title, "Dune");
         db.add_bookmark("b1", 3, 42, "test").unwrap();
         assert_eq!(db.bookmarks_for("b1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn voices_are_model_agnostic() {
+        let db = LibraryDb::in_memory().unwrap();
+        db.add_voice("clarke", "Clarke", "kokoro", "/data/voices/clarke.wav")
+            .unwrap();
+        // A reference clip is a wav on disk: switching to chatterbox-turbo
+        // must not make it vanish (that left the reader with a fake
+        // "<model>-default" voice the worker rejects).
+        let all = db.list_all_voices().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id, "clarke");
+        assert!(db.list_voices("chatterbox-turbo").unwrap().is_empty());
+        assert_eq!(db.list_voices("kokoro").unwrap().len(), 1);
     }
 
     #[test]

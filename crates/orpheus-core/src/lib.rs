@@ -13,6 +13,6 @@ pub mod text;
 pub mod theme;
 
 pub use config::Config;
-pub use db::LibraryDb;
+pub use db::{LibraryDb, VoiceRow};
 pub use document::{Block, BlockKind, BookFormat, Chapter, Document, Sentence};
 pub use theme::{ReaderStyle, Theme};

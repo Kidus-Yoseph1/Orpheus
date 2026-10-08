@@ -1097,6 +1097,12 @@ fn render_voices(f: &mut Frame, app: &App) {
             } else {
                 (app.theme.fg(), app.theme.bg(), Modifier::empty())
             };
+            // Empty id = the "no sample yet" row on clone-only models.
+            let text = if v.id.is_empty() {
+                v.note.clone()
+            } else {
+                format!("{}  · {}", v.id, v.note)
+            };
             ListItem::new(RLine::from(vec![
                 Span::styled(
                     marker,
@@ -1105,14 +1111,7 @@ fn render_voices(f: &mut Frame, app: &App) {
                         .bg(bg)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    v.id.clone(),
-                    Style::default().fg(fg).bg(bg).add_modifier(mods),
-                ),
-                Span::styled(
-                    format!("  · {}", v.note),
-                    Style::default().fg(app.theme.muted_c()).bg(bg),
-                ),
+                Span::styled(text, Style::default().fg(fg).bg(bg).add_modifier(mods)),
             ]))
         })
         .collect();

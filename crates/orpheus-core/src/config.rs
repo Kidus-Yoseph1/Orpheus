@@ -104,6 +104,12 @@ pub struct TtsConfig {
     /// two models cannot stay resident on a 4 GB card.
     #[serde(default = "default_true")]
     pub manage_worker: bool,
+    /// Explicit `tts-worker/server.py` path; empty = autodetect.
+    #[serde(default)]
+    pub worker_script: String,
+    /// Explicit interpreter for the worker; empty = repo venv, then python3.
+    #[serde(default)]
+    pub worker_python: String,
     #[serde(default)]
     pub gpu: GpuConfig,
 }
@@ -129,6 +135,8 @@ impl Default for TtsConfig {
             voice: default_voice(),
             worker_url: default_worker_url(),
             manage_worker: true,
+            worker_script: String::new(),
+            worker_python: String::new(),
             gpu: GpuConfig::default(),
         }
     }
