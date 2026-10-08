@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod cli;
+mod export;
 mod ui;
 mod worker_ctl;
 
@@ -88,9 +89,13 @@ fn main() -> Result<()> {
         }
     }
 
+    if cli.export {
+        return run_headless_export(&mut app);
+    }
+
     run_tui(&mut app)?;
     // Shut the worker down with the reader (it holds VRAM).
-    app.worker.stop();
+    app.worker.shutdown(&app.rt);
     // Persist on exit.
     app.persist_position();
     app.config.reader.theme = app.theme.name.clone();
@@ -157,17 +162,70 @@ fn worker_check(app: &mut App) -> Result<()> {
             ),
             Err(e) => {
                 println!("  synthesis ✗ {e}");
-                app.worker.stop();
+                app.worker.shutdown(&app.rt);
                 return Ok(());
             }
         }
-        app.worker.stop();
+        app.worker.shutdown(&app.rt);
         println!("  worker stopped (freeing VRAM)");
     } else {
         println!("✗ worker did not become ready (missing model or env?)");
-        app.worker.stop();
+        app.worker.shutdown(&app.rt);
     }
     Ok(())
+}
+
+/// `--export`: render the open book to one file, headless. Progress goes to
+/// stderr; the finished path goes to stdout so scripts can pick it up.
+fn run_headless_export(app: &mut App) -> Result<()> {
+    if app.book.is_none() {
+        eprintln!("--export needs a book: orpheus <book.epub> --export");
+        std::process::exit(2);
+    }
+    app.toggle_export();
+    if !app.export_active() {
+        eprintln!(
+            "{}",
+            app.status_msg
+                .clone()
+                .unwrap_or_else(|| "export could not start".into())
+        );
+        app.worker.shutdown(&app.rt);
+        std::process::exit(1);
+    }
+
+    let mut last_pct = usize::MAX;
+    let started = std::time::Instant::now();
+    while app.export.is_some() {
+        worker_ctl::supervise(app);
+        app.tick_export();
+        if let (Some(msg), Some(job)) = (&app.status_msg, app.export.as_ref()) {
+            let pct = if job.total > 0 {
+                job.done * 100 / job.total
+            } else {
+                0
+            };
+            if pct != last_pct {
+                eprintln!("{msg}");
+                last_pct = pct;
+            }
+        }
+        if started.elapsed().as_secs() > 6 * 3600 {
+            eprintln!("export timed out after 6h");
+            app.export = None;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    app.worker.shutdown(&app.rt);
+    let outcome = app.status_msg.clone().unwrap_or_default();
+    if outcome.starts_with('\u{2713}') {
+        println!("{outcome}");
+        Ok(())
+    } else {
+        eprintln!("{outcome}");
+        std::process::exit(1);
+    }
 }
 
 fn run_tui(app: &mut App) -> Result<()> {
@@ -221,6 +279,7 @@ fn on_tick(app: &mut App) {
     app.tick_voice_save();
     // Keep exactly one worker alive, serving the selected model.
     worker_ctl::supervise(app);
+    app.tick_export();
     // Don't try to play audio while the worker is still loading.
     if !app.worker_waiting {
         app.tick_playback();
@@ -337,6 +396,7 @@ fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         KeyCode::Char('?') => app.goto(Screen::Help),
         KeyCode::Char(' ') => app.toggle_play(),
+        KeyCode::Char('x') => app.toggle_export(),
         KeyCode::Left => {
             if shift {
                 app.prev_sentence();

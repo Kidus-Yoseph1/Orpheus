@@ -244,6 +244,11 @@ impl Config {
         Self::data_dir().join("cache").join("audio")
     }
 
+    /// Finished whole-book exports: `<data>/exports/<book>-<voice>-<model>.m4a`.
+    pub fn exports_dir() -> PathBuf {
+        Self::data_dir().join("exports")
+    }
+
     /// Normalized user voice references: `<data>/voices/<id>.wav`.
     /// The worker is started with the same dir (`--voices-dir`).
     pub fn voices_dir() -> PathBuf {

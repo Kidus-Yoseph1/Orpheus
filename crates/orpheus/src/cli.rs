@@ -31,6 +31,11 @@ pub struct Cli {
     #[arg(long)]
     pub worker_check: bool,
 
+    /// Render the whole book to one audio file without opening the TUI:
+    /// `orpheus book.epub --export`. Progress on stderr, output path on stdout.
+    #[arg(long)]
+    pub export: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
