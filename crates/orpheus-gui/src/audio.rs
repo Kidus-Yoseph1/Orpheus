@@ -1,6 +1,7 @@
 //! Local audio playback via ffplay, with true pause (SIGSTOP/SIGCONT).
 //! Mirrors the TUI's player so speed stays a playback concern.
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -30,20 +31,27 @@ impl Player {
     pub fn play(&mut self, path: &Path, speed: f32) -> anyhow::Result<()> {
         self.stop();
         let af = format!("atempo={:.2}", speed.clamp(0.5, 100.0));
-        let child = Command::new(&self.bin)
-            .args([
-                "-nodisp",
-                "-autoexit",
-                "-loglevel",
-                "quiet",
-                "-af",
-                &af,
-                &path.to_string_lossy(),
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut cmd = Command::new(&self.bin);
+        cmd.args([
+            "-nodisp",
+            "-autoexit",
+            "-loglevel",
+            "quiet",
+            "-af",
+            &af,
+            &path.to_string_lossy(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+        // Die with the reader, even on SIGKILL, so no orphan ffplay survives.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                Ok(())
+            });
+        }
+        let child = cmd.spawn()?;
         self.child = Some(child);
         self.paused = false;
         Ok(())
@@ -102,5 +110,11 @@ impl Player {
 impl Default for Player {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
