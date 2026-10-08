@@ -4,6 +4,8 @@
 # personal books — never commit
 *.epub
 *.pdf
+# ...except the PDF parser's test fixtures, which must stay in the repo
+!crates/orpheus-core/tests/fixtures/*.pdf
 # personal audio (book chapters, voice samples) — never commit
 /voices/
 *.mp3
