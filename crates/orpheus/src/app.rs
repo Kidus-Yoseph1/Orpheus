@@ -1,7 +1,7 @@
 //! GUIDE §31 — central AppState + screen navigation.
 //! No app state lives inside render functions.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use orpheus_core::{Config, Document, LibraryDb, ReaderStyle, Theme};
@@ -91,6 +91,8 @@ pub struct App {
     /// Ticks spent asking a foreign worker on our port to leave.
     pub worker_evict_attempts: u8,
     pub worker_paths: crate::worker_ctl::WorkerPaths,
+    /// Whole-book export job (render every sentence, then join).
+    pub export: Option<crate::export::ExportJob>,
     /// Sample length per reference path, keyed by (path, mtime): ffprobe is
     /// ~30ms and the picker lists every clone, so probe once per file.
     voice_dur_cache: std::collections::HashMap<String, (std::time::SystemTime, f64)>,
@@ -339,6 +341,36 @@ pub fn probe_secs(path: &PathBuf) -> std::result::Result<f64, String> {
         .map_err(|_| "could not read audio length".into())
 }
 
+/// One sentence's audio: the shared entry point for playback, previews and
+/// export — cache hit returns instantly, otherwise ask the worker.
+pub fn synthesize_one(
+    rt: &tokio::runtime::Runtime,
+    cache_dir: &Path,
+    url: &str,
+    model: &str,
+    voice: &str,
+    text: &str,
+) -> std::result::Result<PathBuf, String> {
+    let (_, cands) = worker_cache_candidates(cache_dir, model, voice, text);
+    if let Some(hit) = cands.iter().find(|p| p.is_file()) {
+        return Ok(hit.clone());
+    }
+    let worker =
+        WorkerBackend::new(url.to_string(), model.to_string()).map_err(|e| e.to_string())?;
+    let req = orpheus_tts::SynthesisRequest {
+        request_id: uuid::Uuid::new_v4().to_string(),
+        model: model.to_string(),
+        voice: voice.to_string(),
+        text: text.to_string(),
+        speed: 1.0,
+        out_path: cands[0].clone(),
+    };
+    use orpheus_tts::TTSBackend;
+    rt.block_on(worker.synthesize(&req))
+        .map(|r| r.audio_path)
+        .map_err(|e| e.to_string())
+}
+
 /// Suggest the first sample found in ~/voices/ to cut typing.
 pub fn default_sample_hint() -> Option<String> {
     let dir = dirs::home_dir()?.join("voices");
@@ -411,6 +443,7 @@ impl App {
             worker_load_started: std::time::Instant::now(),
             worker_evict_attempts: 0,
             voice_dur_cache: std::collections::HashMap::new(),
+            export: None,
             worker_paths: crate::worker_ctl::WorkerPaths {
                 script: (!config.tts.worker_script.is_empty())
                     .then(|| std::path::PathBuf::from(config.tts.worker_script.clone())),
@@ -610,25 +643,14 @@ impl App {
         voice: &str,
         text: &str,
     ) -> std::result::Result<PathBuf, String> {
-        let (_, cands) = worker_cache_candidates(&self.audio_cache_dir, model, voice, text);
-        if let Some(hit) = cands.iter().find(|p| p.is_file()) {
-            return Ok(hit.clone());
-        }
-        let worker = WorkerBackend::new(self.config.tts.worker_url.clone(), model.to_string())
-            .map_err(|e| e.to_string())?;
-        let req = orpheus_tts::SynthesisRequest {
-            request_id: uuid::Uuid::new_v4().to_string(),
-            model: model.to_string(),
-            voice: voice.to_string(),
-            text: text.to_string(),
-            speed: 1.0,
-            out_path: cands[0].clone(),
-        };
-        use orpheus_tts::TTSBackend;
-        self.rt
-            .block_on(worker.synthesize(&req))
-            .map(|r| r.audio_path)
-            .map_err(|e| e.to_string())
+        synthesize_one(
+            &self.rt,
+            &self.audio_cache_dir,
+            &self.config.tts.worker_url,
+            model,
+            voice,
+            text,
+        )
     }
 
     // --- Add-voice editor ---------------------------------------------------------
@@ -724,6 +746,118 @@ impl App {
                 self.status_msg = Some("transcode produced no usable audio".into());
             }
         }
+    }
+
+    // --- Whole-book export ---------------------------------------------------------
+
+    pub fn export_active(&self) -> bool {
+        self.export
+            .as_ref()
+            .map(|e| e.phase.is_active())
+            .unwrap_or(false)
+    }
+
+    /// `x`: start an export, or cancel the running one.
+    pub fn toggle_export(&mut self) {
+        if self.export_active() {
+            if let Some(job) = &self.export {
+                job.request_cancel();
+            }
+            self.status_msg = Some("cancelling export\u{2913}\u{2026}".into());
+            return;
+        }
+        self.export = None;
+        self.start_export();
+    }
+
+    fn start_export(&mut self) {
+        if self.book.is_none() {
+            self.status_msg = Some("no book open".into());
+            return;
+        }
+        if !self.worker_supported() {
+            self.status_msg = Some(format!(
+                "{} has no voice yet — press m to pick one",
+                self.tts.current_model_id
+            ));
+            return;
+        }
+        if !self.player.available() {
+            self.status_msg = Some("ffplay not found — install ffmpeg".into());
+            return;
+        }
+        let (title, texts) = {
+            let Some(book) = &self.book else { return };
+            let texts: Vec<String> = book
+                .flat_sentences()
+                .into_iter()
+                .filter_map(|(_, _, _, s)| {
+                    let t = s.speak_text.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(t.to_string())
+                    }
+                })
+                .collect();
+            (book.title.clone(), texts)
+        };
+        // Narration and export both drive the worker; one at a time.
+        self.player.stop();
+        self.buffering = false;
+        self.playback = PlaybackState::Stopped;
+
+        let model = self.tts.current_model_id.clone();
+        let voice = self.tts.current_voice_id.clone();
+        let out = crate::export::export_path(&title, &voice, &model);
+        match crate::export::ExportJob::start(
+            texts,
+            self.config.tts.worker_url.clone(),
+            model,
+            voice,
+            out,
+        ) {
+            Ok(job) => {
+                self.export = Some(job);
+                self.status_msg = Some("⤓ export started…".into());
+            }
+            Err(e) => self.status_msg = Some(format!("export: {e}")),
+        }
+    }
+
+    /// Drain export events each tick and report progress in the status line.
+    pub fn tick_export(&mut self) {
+        let Some(job) = self.export.as_mut() else {
+            return;
+        };
+        job.poll();
+        let done = job.done;
+        let total = job.total;
+        let phase = job.phase.clone();
+
+        let (msg, finished) = match phase {
+            crate::export::Phase::Starting => {
+                ("⤓ export: waiting for the worker…".to_string(), false)
+            }
+            crate::export::Phase::Rendering => {
+                let pct = if total > 0 { done * 100 / total } else { 0 };
+                (
+                    format!("rendering {pct}% ({done}/{total}) - x cancels"),
+                    false,
+                )
+            }
+            crate::export::Phase::Joining => (format!("⤓ joining {total} clips…"), false),
+            crate::export::Phase::Done(path) => (format!("✓ exported → {}", path.display()), true),
+            crate::export::Phase::Failed(e) => (format!("export failed: {e}"), true),
+            crate::export::Phase::Cancelled => (
+                "export cancelled — cached sentences are free on restart".to_string(),
+                true,
+            ),
+        };
+        if finished {
+            self.export = None;
+        }
+        self.status_msg = Some(msg);
     }
 
     pub fn goto(&mut self, s: Screen) {
@@ -1339,12 +1473,13 @@ impl App {
             return m.clone();
         }
         match self.screen {
-            Screen::Home => "Enter open · o directory · t looks · m models · v voices · ? help · q quit".into(),
-            Screen::Directory => {
-                "Enter open · r rescan · Esc back · q quit".into()
+            Screen::Home => {
+                "Enter open · o directory · t looks · m models · v voices · ? help · q quit".into()
             }
+            Screen::Directory => "Enter open · r rescan · Esc back · q quit".into(),
             Screen::Reader => {
-                "Space play · ←/→ seek · n/p chapter · j/k scroll · / search · b bookmark · t looks · ? help".into()
+                "Space play · ←/→ seek · n/p chapter · j/k scroll · / search · x export · ? help"
+                    .into()
             }
             _ => "Esc back · q quit".into(),
         }

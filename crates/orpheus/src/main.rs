@@ -1,6 +1,7 @@
 mod app;
 mod audio;
 mod cli;
+mod export;
 mod ui;
 mod worker_ctl;
 
@@ -221,6 +222,7 @@ fn on_tick(app: &mut App) {
     app.tick_voice_save();
     // Keep exactly one worker alive, serving the selected model.
     worker_ctl::supervise(app);
+    app.tick_export();
     // Don't try to play audio while the worker is still loading.
     if !app.worker_waiting {
         app.tick_playback();
@@ -337,6 +339,7 @@ fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         }
         KeyCode::Char('?') => app.goto(Screen::Help),
         KeyCode::Char(' ') => app.toggle_play(),
+        KeyCode::Char('x') => app.toggle_export(),
         KeyCode::Left => {
             if shift {
                 app.prev_sentence();

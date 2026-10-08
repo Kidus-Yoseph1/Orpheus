@@ -670,7 +670,7 @@ fn render_reader_footer(f: &mut Frame, app: &App, pct: f32, area: Rect, minimal:
         f.render_widget(
             hint_bar(
                 app,
-                "space play · ←/→ sentence · n/p chapter · j/k scroll · / find · t looks · ? help",
+                "space play · ←/→ sentence · n/p chapter · j/k scroll · / find · x export · t looks · ? help",
             ),
             top[2],
         );
@@ -1280,6 +1280,7 @@ fn render_help(f: &mut Frame, app: &App) {
         ("- / + · 0", "speed down / up / reset"),
         ("/", "search in book"),
         ("b", "bookmark"),
+        ("x", "export whole book to one audio file"),
         ("t", "appearance — themes & styles"),
         ("v / m", "voices / TTS models"),
         ("?", "this help"),
