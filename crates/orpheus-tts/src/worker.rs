@@ -89,7 +89,6 @@ struct SynthReply {
 #[derive(Debug, Deserialize)]
 struct HealthReply {
     ok: bool,
-    #[allow(dead_code)]
     model: Option<String>,
     #[allow(dead_code)]
     loaded: Option<bool>,
@@ -130,6 +129,28 @@ impl WorkerBackend {
             model_id: model_id.into(),
             client,
         })
+    }
+
+    /// Model id the worker in front of us is serving, when it answers.
+    ///
+    /// Used to reconcile whatever is already listening on the port — a
+    /// manually started worker, or an orphan left by a hard kill.
+    pub async fn serving_model(&self) -> Result<Option<String>> {
+        let reply: HealthReply = self.get_json("/health").await?;
+        Ok(reply.model)
+    }
+
+    /// Ask a worker to exit. Its process is not ours to kill (it may have
+    /// been started by hand), so this is the polite way to reclaim the port.
+    pub async fn shutdown(&self) -> Result<()> {
+        let url = format!("{}/shutdown", self.base_url);
+        let _ = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .map_err(|e| TtsError::Backend(e.to_string()))?;
+        Ok(())
     }
 
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {

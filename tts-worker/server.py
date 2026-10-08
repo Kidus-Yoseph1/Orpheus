@@ -536,6 +536,12 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 self._send(500, {"error": str(e)})
             return
+        if path == "/shutdown":
+            # The reader owns this port: reclaim it (model switch, orphaned
+            # process after a hard kill) and release VRAM.
+            self._send(200, {"ok": True})
+            threading.Timer(0.2, os._exit, [0]).start()
+            return
         if path != "/synthesize":
             self._send(404, {"error": "unknown route"})
             return
