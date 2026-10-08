@@ -6,10 +6,11 @@ Read EPUB books in a calm, Foliate-style page and listen to them with local
 text-to-speech. Terminal-first, keyboard-first, fully offline after models
 are pulled.
 
-> Status: reader + library + themes work. Narration works via the `book-tts`
-> worker (Kokoro-82M, local GPU/CPU) + ffplay playback, including cloned
-> narrator voices (Kokoro render + OpenVoice conversion, ~1.7 GB VRAM).
-> `mock` model keeps the highlight-only timer for UI exercise.
+> Status: reader + library + themes + narration all work. Two engines are
+> wired: **Kokoro-82M** (fast, CPU/GPU) and **Chatterbox Turbo** (native
+> voice cloning, ~2.8 GB VRAM). Narration runs through a local `book-tts`
+> worker that Orpheus starts and stops for you, with cloned narrator
+> voices. `mock` model keeps a highlight-only timer for UI exercise.
 
 ## Features
 
@@ -22,6 +23,10 @@ are pulled.
 - Model-agnostic TTS abstraction: switch lightweight (background work) and
   heavy (focused listening) models without losing your place; type any model
   id to queue it for pulling
+- Voice cloning: register a 6–30 s clean sample once, then narrate in that
+  voice with either engine (clips are model-agnostic, not locked to one model)
+- One worker at a time: switching models frees VRAM, spawns the new worker
+  and keeps your book position
 
 ## Install
 
@@ -260,11 +265,20 @@ no giant torch re-download, base env untouched (needs system
 ./tts-worker/install.sh [conda-env-name]   # default env: ml_base
 ```
 
-### 3. Serve + listen
+### 3. Listen (the worker starts itself)
+
+```sh
+cargo run -p orpheus -- "mybook.epub"     # Space plays real audio
+orpheus --worker-check                    # or verify the whole chain headlessly
+```
+
+With `[tts] manage_worker = true` (the default) Orpheus spawns `book-tts` for
+the selected model on the first tick, waits for `⏳ starting …` to clear, and
+kills it again when you quit — so VRAM is free when you are not listening.
+Prefer to run it yourself? Set `manage_worker = false`:
 
 ```sh
 tts-worker/.venv312/bin/python tts-worker/server.py --model kokoro --preload   # :8765, --help for flags
-cargo run -p orpheus -- "mybook.epub"                  # Space plays real audio
 ```
 
 Playback: sentences synthesize to `~/.local/share/orpheus/cache/audio/`
@@ -287,11 +301,24 @@ Or **with chatterbox-turbo** (`m` → select it): cloning is native, no
 conversion step, but it wants a ≥6s sample (10–30s ideal) and costs ~2.8 GB
 VRAM with a 32s cold load.
 
-Then in Orpheus: `v` → `a` → name it + point at the file → `Enter` saves
-(a normalized copy lands in `~/.local/share/orpheus/voices/`, original
-untouched) → `p` previews → `Enter` selects → `Space` narrates the book
-in that voice. `d` deletes a clone. The converter loads lazily on first
-clone use, so kokoro-only sessions stay at ~1.4 GB.
+**Where samples go.** Drop clips in `~/voices/` (the add form suggests the
+first file it finds there), or type any absolute path — wav/mp3/flac/m4a all
+work. In Orpheus: `v` → `a` → name it → point at the file → `Enter`. The clip
+is normalized (silence trimmed, gain to −20 dB, limiter) into
+`~/.local/share/orpheus/voices/<name>.wav` — the original is untouched — and
+registered in the database.
+
+**A clip is model-agnostic**: add it once and it is available to *both*
+engines (kokoro clones it through OpenVoice, chatterbox clones natively).
+Length rules are enforced per model: ≥6 s for chatterbox (10–30 s is the
+sweet spot), ≥3 s otherwise, ≤300 s. Too short and the form tells you; cut a
+slice with `ffmpeg -ss 90 -t 25 -i in.mp3 -ar 24000 -ac 1 ~/voices/x.wav`.
+
+Then `p` previews in the current model, `Enter` selects it (`Space` narrates),
+`d` deletes the clone everywhere. Switching models keeps the selection only
+if the clip still meets the new model's minimum — otherwise Orpheus picks the
+first usable one and says so in the status line. The OpenVoice converter
+loads lazily on first clone use, so kokoro-only sessions stay at ~1.4 GB.
 
 ## Adding a new model
 
@@ -346,6 +373,26 @@ Clone-only engines (no built-in voices) are detected from `BackendKind`: the
 voices screen then lists only real samples and never a fake `<id>-default`.
 Register a ≥6 s sample with `v` → `a` before expecting audio.
 
+## Troubleshooting
+
+Start with the headless check — it spawns the worker, loads the model,
+synthesizes one line and exits, printing exactly where things break:
+
+```sh
+orpheus --worker-check --model chatterbox-turbo
+```
+
+| Symptom | Cause / fix |
+| ------- | ----------- |
+| `tts-worker/server.py not found` | launch cwd is outside the checkout; set `worker_script` / `worker_python` in `[tts]`, or `ORPHEUS_WORKER_SCRIPT` |
+| `⏳ starting …` never clears | worker failed to load; see `~/.local/share/orpheus/logs/worker-<model>.log` |
+| `CUDA out of memory` | two models resident at once; quit other GPU apps, keep `manage_worker = true` |
+| `worker serves 'kokoro', got '…'` | a manually started worker is on the wrong model; let Orpheus manage it, or restart it with `--model` |
+| `chatterbox has no built-in voices` | no usable clone: `v` → `a` with a ≥6 s sample |
+| `ffplay not found` | install `ffmpeg` |
+| silent / zero-length audio | inspect `logs/worker-<model>.log`; `ffprobe` on a cached `.opus` |
+| model shows `pull on use` | not downloaded yet — run `download.py` (see above) |
+
 ## Development
 
 Workspace crates:
@@ -361,7 +408,8 @@ Workspace crates:
 ```sh
 cargo build              # debug build
 cargo test               # segmentation, EPUB + stable IDs, DB resume,
-                         # store manifests, Rust/Python cache-key parity, worker stub
+                         # store manifests, Rust/Python cache-key parity,
+                         # voice selection rules, worker discovery, ffplay stub
 cargo fmt                # format
 cargo clippy --all       # lint
 ```
