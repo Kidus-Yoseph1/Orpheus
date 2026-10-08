@@ -399,20 +399,20 @@ fn reader_key(app: &mut App, code: KeyCode, mods: KeyModifiers) {
         KeyCode::Char('x') => app.toggle_export(),
         KeyCode::Left => {
             if shift {
-                app.prev_sentence();
-            } else {
                 for _ in 0..app.config.playback.seek_seconds.max(1).min(5) {
                     app.prev_sentence();
                 }
+            } else {
+                app.prev_sentence();
             }
         }
         KeyCode::Right => {
             if shift {
-                app.next_sentence();
-            } else {
                 for _ in 0..app.config.playback.seek_seconds.max(1).min(5) {
                     app.next_sentence();
                 }
+            } else {
+                app.next_sentence();
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {

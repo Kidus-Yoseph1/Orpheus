@@ -94,7 +94,7 @@ Styles: `classic`, `paper`, `sepia`, `midnight`, `focus`, `minimal`.
 | Key | Action |
 | --- | ------ |
 | `Space` | play / pause narration |
-| `←` / `→` | seek back / forward (Shift: prev / next sentence) |
+| `←` / `→` | prev / next sentence (Shift: seek) |
 | `j` / `k`, `↑` / `↓` | scroll (`Ctrl` + key: 10 lines) |
 | `n` / `p` | next / previous chapter |
 | `-` / `+`, `0` | speed down / up / reset |
