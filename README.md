@@ -27,6 +27,8 @@ are pulled.
   voice with either engine (clips are model-agnostic, not locked to one model)
 - One worker at a time: switching models frees VRAM, spawns the new worker
   and keeps your book position
+- Audiobook export: render the whole book to one audio file — press `x` in
+  the reader, or run `orpheus book.epub --export` headless
 
 ## Install
 
@@ -66,6 +68,7 @@ orpheus --model kokoro            # start with a TTS model
 orpheus --voice kokoro-default    # start with a voice
 orpheus --model chatterbox-turbo  # switch to native-cloning engine
 orpheus --worker-check            # spawn worker, synthesize a test line, exit
+orpheus --export                  # render the whole book to one audio file
 orpheus "book.epub" --theme sepia --model chatterbox-turbo
 
 orpheus voices                    # open the voice manager
@@ -95,6 +98,7 @@ Styles: `classic`, `paper`, `sepia`, `midnight`, `focus`, `minimal`.
 | `t` | appearance: themes + reader styles (live preview) |
 | `v` | voices (enter select · a add sample · p preview · d delete) |
 | `m` | TTS models |
+| `x` | export the whole book to one audio file (press again: cancel) |
 | `g` / `G` | first / last chapter |
 | `?` | help |
 | `q` | quit |
@@ -319,6 +323,37 @@ Then `p` previews in the current model, `Enter` selects it (`Space` narrates),
 if the clip still meets the new model's minimum — otherwise Orpheus picks the
 first usable one and says so in the status line. The OpenVoice converter
 loads lazily on first clone use, so kokoro-only sessions stay at ~1.4 GB.
+
+## Export an audiobook
+
+Turn the open book into a single audio file and listen anywhere (car, gym,
+phone player). The text is rendered sentence by sentence with the current
+model and voice, then joined with ffmpeg into one file.
+
+**In the reader:** press `x`. The status line shows the phases —
+`waiting for the worker…` (cold start, up to ~3 min for chatterbox),
+`rendering 40% (120/300) - x cancels`, `joining 300 clips…`, then
+`✓ exported → …`. Press `x` again at any point to cancel: nothing is lost,
+every sentence already rendered stays in the audio cache.
+
+**Headless (no TUI, scriptable):**
+
+```sh
+orpheus ~/Books/dune.epub --export                  # current config voice/model
+orpheus ~/Books/dune.epub --export --model kokoro --voice clarke
+OUT=$(orpheus dune.epub --export)   # path on stdout, progress on stderr
+```
+
+It exits 0 and prints the path on success, non-zero with the reason on
+stderr on failure (worker never ready, synthesis error, ffmpeg missing).
+
+**Where the file goes:** `~/.local/share/orpheus/exports/<book>-<voice>-<model>.m4a`
+(AAC in an MP4 container, one file, phone-friendly). Path is also in the
+reader's status line / the command's stdout.
+
+**Cost:** sentences you already heard come from the audio cache and cost
+nothing. A cold book is `#sentences` syntheses — patience with a 4 GB GPU
+and chatterbox (they queue behind whatever else is on the device).
 
 ## Adding a new model
 
