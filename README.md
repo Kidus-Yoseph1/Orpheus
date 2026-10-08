@@ -14,7 +14,12 @@ are pulled.
 
 ## Features
 
-- EPUB library: open a file or scan a directory, continue where you left off
+- Library: open an `.epub` or a text-layer `.pdf`, scan a directory,
+  continue where you left off
+- PDF loading: wrapped lines rejoin into paragraphs, standalone page
+  numbers drop out, short title lines become headings, and pages group into
+  `Pages 1–10` style chapters; image-only (scanned) PDFs fail fast with a
+  clear `needs OCR` message instead of a blank book
 - Foliate-style reader: centered column, flowing paragraphs, inline
   narration highlight, chapter headings, quotes, lists
 - 6 themes + 6 reader styles with live preview (`t`)
@@ -390,6 +395,7 @@ orpheus --worker-check --model chatterbox-turbo
 | `worker serves 'kokoro', got '…'` | a manually started worker is on the wrong model; let Orpheus manage it, or restart it with `--model` |
 | `chatterbox has no built-in voices` | no usable clone: `v` → `a` with a ≥6 s sample |
 | `ffplay not found` | install `ffmpeg` |
+| PDF: `no selectable text … OCR` | scanned/image-only PDF — OCR is not implemented yet; export a text layer first (e.g. `ocrmypdf in.pdf out.pdf`) |
 | silent / zero-length audio | inspect `logs/worker-<model>.log`; `ffprobe` on a cached `.opus` |
 | model shows `pull on use` | not downloaded yet — run `download.py` (see above) |
 
