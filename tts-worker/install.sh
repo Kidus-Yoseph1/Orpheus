@@ -1,41 +1,86 @@
 #!/usr/bin/env bash
-# Reproducible worker env: reuse an env that already has torch+CUDA (here
-# ml_base), keeping the base env untouched via an isolated venv.
-# OpenVoice's pins are ancient (numpy 1.22 source build) so it installs
-# with --no-deps; runtime-tested imports pull the modern remainder.
+# Conda-free worker setup.
 #
-# Usage: ./install.sh [conda-env-name]   (default: ml_base)
+# Reuses a Python that already has torch, so there is no multi-GB torch
+# download. Kokoro English narration needs only torch + kokoro + soundfile.
+# Voice cloning needs OpenVoice on top and is optional.
+#
+# Usage:
+#   ./install.sh [python] [--cloning] [--install-torch]
+#
+# Examples:
+#   ./install.sh /path/to/venv/bin/python     # reuse an env that has torch
+#   ORPHEUS_PYTHON=/path/to/python ./install.sh
+#   ./install.sh python3 --install-torch      # only if you have no torch yet
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WANT_ENV="${1:-ml_base}"
 
-find_conda_base() {
-    if [ -n "${CONDA_EXE:-}" ]; then
-        dirname "$(dirname "$CONDA_EXE")"
-        return 0
-    fi
-    if command -v conda >/dev/null 2>&1; then
-        conda info --base 2>/dev/null && return 0
-    fi
-    for d in "$HOME/miniconda3" "$HOME/anaconda3" /opt/miniconda3; do
-        [ -x "$d/bin/python" ] && { echo "$d"; return 0; }
+CLONING=0
+INSTALL_TORCH=0
+PY=""
+for a in "$@"; do
+    case "$a" in
+        --cloning) CLONING=1 ;;
+        --install-torch) INSTALL_TORCH=1 ;;
+        -*) echo "unknown flag: $a" >&2; exit 2 ;;
+        *) PY="$a" ;;
+    esac
+done
+
+# Locate a Python: explicit arg > $ORPHEUS_PYTHON > first one that can import
+# torch > plain python3.
+if [ -z "$PY" ] && [ -n "${ORPHEUS_PYTHON:-}" ]; then
+    PY="$ORPHEUS_PYTHON"
+fi
+if [ -z "$PY" ]; then
+    for c in "$HERE/.venv312/bin/python" python3 python; do
+        if command -v "$c" >/dev/null 2>&1 && "$c" -c "import torch" 2>/dev/null; then
+            PY="$(command -v "$c")"; break
+        fi
     done
-    return 1
-}
-
-BASE="$(find_conda_base)" || {
-    echo "error: no conda found; install miniconda or pass a python explicitly" >&2
-    exit 1
-}
-PY="$BASE/envs/$WANT_ENV/bin/python"
-[ -x "$PY" ] || {
-    echo "error: no python at $PY (conda env '$WANT_ENV' missing?)" >&2
-    exit 1
-}
+fi
+if [ -z "$PY" ]; then
+    PY="$(command -v python3 || command -v python || true)"
+fi
+[ -n "$PY" ] || { echo "error: no Python found; pass one: ./install.sh /path/to/python" >&2; exit 1; }
+echo "python: $PY"
 "$PY" --version
 
-"$PY" -m venv --system-site-packages "$HERE/.venv312"
-VENV="$HERE/.venv312/bin/pip"
-"$VENV" install --no-deps git+https://github.com/myshell-ai/OpenVoice.git
-"$VENV" install -r "$HERE/requirements.txt"
-"$HERE/.venv312/bin/python" -c "from openvoice import se_extractor; from openvoice.api import ToneColorConverter; print('worker env OK')"
+# Prefer uv (works even when the env has no pip, e.g. uv-created venvs).
+install_pkgs() {
+    if command -v uv >/dev/null 2>&1; then
+        uv pip install --python "$PY" "$@"
+    elif "$PY" -m pip --version >/dev/null 2>&1; then
+        "$PY" -m pip install "$@"
+    else
+        echo "error: need uv or pip to install packages" >&2
+        return 1
+    fi
+}
+
+if ! "$PY" -c "import torch" 2>/dev/null; then
+    if [ "$INSTALL_TORCH" = "1" ]; then
+        echo "installing torch + torchaudio (large download)..."
+        install_pkgs torch torchaudio
+    else
+        echo "error: $PY has no torch." >&2
+        echo "Point me at a Python that has torch, or pass --install-torch." >&2
+        echo "  ./install.sh /path/to/venv/bin/python" >&2
+        exit 1
+    fi
+fi
+"$PY" -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')"
+
+echo "installing worker deps (packages already present are skipped)..."
+install_pkgs -r "$HERE/requirements.txt"
+
+if [ "$CLONING" = "1" ]; then
+    echo "installing OpenVoice + librosa (voice cloning)..."
+    install_pkgs librosa
+    install_pkgs --no-deps "git+https://github.com/myshell-ai/OpenVoice.git"
+fi
+
+"$PY" -c "import kokoro, soundfile; print('worker env OK')"
+echo
+echo "run the worker with:"
+echo "  $HERE/run.sh --python $PY"

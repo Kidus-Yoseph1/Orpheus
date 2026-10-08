@@ -40,7 +40,7 @@ are pulled.
 Requirements: Rust 1.75+ (async traits), a terminal with truecolor for best
 results, ffmpeg (provides `ffplay` for audio) for narration. Voice
 narration additionally needs the Python worker (`tts-worker/`, needs a
-conda env with torch — see “TTS: how it works” below).
+Python env with torch — see “TTS: how it works” below).
 
 ```sh
 git clone git@github.com:Kidus-Yoseph1/Orpheus.git
@@ -266,13 +266,16 @@ nothing hides in the HuggingFace cache. Kokoro is ~360 MB, OpenVoice ~130 MB.
 
 ### 2. Set up the worker env (once)
 
-Reuse a conda env that already has torch+CUDA through an isolated venv —
-no giant torch re-download, base env untouched (needs system
-`libespeak-ng` for phonemization and `ffmpeg` for opus + `ffplay`):
+No conda required. Point the installer at a Python that already has torch, so
+there is no multi-GB torch download. `kokoro` bundles espeak-ng through
+`espeakng_loader`; `ffmpeg` is still needed for opus + `ffplay`.
 
 ```sh
-./tts-worker/install.sh [conda-env-name]   # default env: ml_base
+./tts-worker/install.sh /path/to/venv/bin/python   # reuse an existing torch env
+./tts-worker/install.sh /path/to/python --cloning  # optional: OpenVoice cloning
 ```
+
+Set `[tts] worker_python` to that interpreter so the self-managed worker uses it.
 
 ### 3. Listen (the worker starts itself)
 
