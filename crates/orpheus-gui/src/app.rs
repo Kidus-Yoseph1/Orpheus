@@ -97,6 +97,10 @@ pub struct OrpheusGui {
     player: Player,
 
     synth_tx: mpsc::Sender<Job>,
+    results: mpsc::Receiver<(PathBuf, f32)>,
+    durations: std::collections::HashMap<PathBuf, f32>,
+    play_started: Option<Instant>,
+    play_dur: f32,
     pending: HashSet<PathBuf>,
 
     font: FontChoice,
@@ -117,6 +121,7 @@ impl OrpheusGui {
         let voice = config.tts.voice.clone();
 
         let (tx, rx) = mpsc::channel::<Job>();
+        let (res_tx, res_rx) = mpsc::channel::<(PathBuf, f32)>();
         std::thread::spawn(move || {
             let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -136,7 +141,9 @@ impl OrpheusGui {
                     speed: 1.0,
                     out_path: job.out,
                 };
-                let _ = rt.block_on(worker.synthesize(&req));
+                if let Ok(res) = rt.block_on(worker.synthesize(&req)) {
+                    let _ = res_tx.send((res.audio_path, res.duration_secs));
+                }
             }
         });
 
@@ -168,6 +175,10 @@ impl OrpheusGui {
             buffering: false,
             player: Player::new(),
             synth_tx: tx,
+            results: res_rx,
+            durations: std::collections::HashMap::new(),
+            play_started: None,
+            play_dur: 0.0,
             pending: HashSet::new(),
             font,
             serif_loaded,
@@ -388,6 +399,7 @@ impl OrpheusGui {
 
     fn restart_if_playing(&mut self) {
         self.player.stop();
+        self.play_started = None;
         if self.playback == Playback::Playing {
             self.buffering = true;
         }
@@ -473,10 +485,12 @@ impl OrpheusGui {
     }
 
     fn tick_narration(&mut self, ctx: &egui::Context) {
+        while let Ok((p, d)) = self.results.try_recv() {
+            self.durations.insert(p, d);
+        }
         if self.playback != Playback::Playing || self.book.is_none() {
             return;
         }
-        ctx.request_repaint_after(Duration::from_millis(80));
         if self.buffering {
             let Some(text) = self.speak_at(self.cursor) else {
                 if self.advance() {
@@ -494,6 +508,8 @@ impl OrpheusGui {
                         self.buffering = false;
                         self.status = Some(format!("▶ {}", short_voice(&self.voice)));
                         self.status_until = None;
+                        self.play_started = Some(Instant::now());
+                        self.play_dur = self.duration_of(&path).unwrap_or(0.0);
                         self.prefetch();
                     }
                     Err(e) => {
@@ -509,16 +525,45 @@ impl OrpheusGui {
             return;
         }
         if self.player.is_playing() {
+            // Sleep until the sentence should be over, then re-check. This
+            // keeps the gap between sentences small at any speed without
+            // polling every frame.
+            ctx.request_repaint_after(self.time_until_sentence_end());
             return;
         }
         if self.advance() {
             self.buffering = true;
+            self.play_started = None;
             self.prefetch();
             ctx.request_repaint();
         } else {
             self.playback = Playback::Stopped;
             self.set_status("finished");
         }
+    }
+
+    /// Time until the current sentence should have finished, using the known
+    /// audio duration and the playback speed. Falls back to a short poll.
+    fn time_until_sentence_end(&self) -> Duration {
+        if self.play_dur > 0.0 {
+            if let Some(start) = self.play_started {
+                let expected = (self.play_dur / self.speed.max(0.1)) + 0.20;
+                let elapsed = start.elapsed().as_secs_f32();
+                if elapsed < expected {
+                    return Duration::from_secs_f32((expected - elapsed).max(0.02));
+                }
+            }
+        }
+        Duration::from_millis(60)
+    }
+
+    fn duration_of(&mut self, path: &Path) -> Option<f32> {
+        if let Some(d) = self.durations.get(path) {
+            return Some(*d);
+        }
+        let d = probe_duration(path)?;
+        self.durations.insert(path.to_path_buf(), d);
+        Some(d)
     }
 
     // --- views --------------------------------------------------------------
@@ -1126,6 +1171,22 @@ fn build_flat(doc: &Document) -> Vec<Flat> {
 
 fn short_voice(id: &str) -> String {
     id.strip_suffix("-default").unwrap_or(id).to_string()
+}
+
+fn probe_duration(path: &Path) -> Option<f32> {
+    let out = std::process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+        ])
+        .arg(path)
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse::<f32>().ok()
 }
 
 fn col(hex: &str) -> Color32 {
