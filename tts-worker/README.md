@@ -30,6 +30,9 @@ One process serves one model (`--model` picks the engine family):
 - Chatterbox and Kokoro cannot be resident simultaneously on a 4 GB card;
   the Rust reader supervises this process (see `[tts] manage_worker`).
 
+Adding an engine (new backend, new model id, `build_engine` branch) is
+documented in the top-level README under **Adding a new model**.
+
 The manifest schema must stay identical to
 `crates/orpheus-tts/src/store.rs::ModelManifest`.
 

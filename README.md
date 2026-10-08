@@ -293,6 +293,59 @@ untouched) → `p` previews → `Enter` selects → `Space` narrates the book
 in that voice. `d` deletes a clone. The converter loads lazily on first
 clone use, so kokoro-only sessions stay at ~1.4 GB.
 
+## Adding a new model
+
+Two levels, depending on how different the model is from what is wired.
+
+### A. Same engine family — no Rust changes
+
+If the weights are a Kokoro-style repo (or another Chatterbox variant), pull
+it with an explicit backend and it shows up in Models (`m`) immediately:
+
+```sh
+tts-worker/.venv312/bin/python tts-worker/download.py \
+  --id my-kokoro --repo hexgrad/Kokoro-82M --backend kokoro
+```
+
+- `--id` is the model id everywhere (config, database, cache keys, worker arg)
+- `--backend` is recorded in `orpheus-manifest.json` and must be a family the
+  worker understands: `kokoro`, `openvoice`, `chatterbox`, `chatterbox-turbo`
+- `--repo` / `--rev` pin exactly what landed in
+  `~/.local/share/orpheus/models/<id>/`; `--dry-run` previews, `--offline`
+  verifies without network
+- Models are discovered from their manifest on start — no registration step
+
+The worker picks its engine from the id: any id containing `chatterbox` runs
+the Chatterbox engine, everything else runs Kokoro. Pick it with `m` →
+`Enter`, or start with `orpheus --model my-kokoro` / `model = "..."` in
+config. Verify before touching the UI:
+
+```sh
+orpheus --worker-check --model my-kokoro
+```
+
+### B. A genuinely new engine
+
+1. **Pull the weights** — `download.py --id <id> --repo <org/name> --backend <family>`
+   (any label is fine as long as step 2 understands it).
+2. **Teach the worker** (`tts-worker/server.py`):
+   - add an engine class with the same surface as `ChatterboxTurboEngine`:
+     `resolve_voice(voice) -> (kind, path)`, `generate(text, ref)`,
+     `ensure_loaded()`
+   - branch on the id/backend in `build_engine(args, model_dir, ...)`
+   - load from the app-owned store (`from_local` / explicit paths) — never the
+     HuggingFace cache — and report real VRAM + cold-load in the tables above
+3. **Teach the reader** (`crates/orpheus-tts/src/lib.rs`):
+   - `BackendKind::MyEngine` plus `as_str`, `from_id`, `weight_class`
+   - add it to `worker_supported()` in `crates/orpheus/src/app.rs`, otherwise
+     the model lists as installed but `Space` refuses with "no voice yet"
+4. **Verify**: `orpheus --worker-check --model <id>` (spawn → load → synthesize
+   one line → exit), then `m` → select → `Space` on a real book.
+
+Clone-only engines (no built-in voices) are detected from `BackendKind`: the
+voices screen then lists only real samples and never a fake `<id>-default`.
+Register a ≥6 s sample with `v` → `a` before expecting audio.
+
 ## Development
 
 Workspace crates:
