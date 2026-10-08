@@ -38,11 +38,17 @@ The manifest schema must stay identical to
 
 ## Setup
 
-```sh
-./install.sh [conda-env-name]   # reuses a torch+CUDA env via isolated .venv312
-```
+Conda-free. Reuses a Python that already has torch, so there is no multi-GB
+torch download. Point the installer at a venv with a CUDA torch; `kokoro`
+bundles espeak-ng via `espeakng_loader`. `ffmpeg` is still needed for opus and
+`ffplay`.
 
-Needs system `libespeak-ng` (phonemization) and `ffmpeg` (opus + `ffplay`).
+```sh
+./install.sh /path/to/venv/bin/python   # reuse an existing torch env
+ORPHEUS_PYTHON=/path/to/python ./install.sh
+./install.sh python3 --install-torch    # only if you have no torch yet
+./install.sh /path/to/python --cloning  # add OpenVoice for cloned voices
+```
 
 ## Pull models (explicit — nothing downloads silently)
 
@@ -51,12 +57,16 @@ python3 download.py --id kokoro --repo hexgrad/Kokoro-82M --backend kokoro
 python3 download.py --id openvoice-v2 --repo myshell-ai/OpenVoiceV2 --backend openvoice
 ```
 
-Options: `--dry-run` to preview, `--rev <commit>` to pin (resolved commit
-is recorded in the manifest), `--models-dir`, `--offline`.
+`download.py` pulls only the files a backend loads by default (weights,
+config, voices), not the whole repo's docs and samples; override with
+`--files`. Options: `--dry-run` to preview, `--rev <commit>` to pin (resolved
+commit is recorded in the manifest), `--models-dir`, `--offline`, `--files`.
 
 ## Serve
 
 ```sh
-.venv312/bin/python server.py --model kokoro --preload   # :8765
+./run.sh                                       # auto-detect a Python with kokoro
+./run.sh --python /path/to/venv/bin/python     # or name one
+./run.sh --device cpu --port 9000              # extra server flags pass through
 server.py --help   # --port, --device auto|cuda|cpu, --voices-dir, --ov-model
 ```

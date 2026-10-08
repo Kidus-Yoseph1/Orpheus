@@ -23,6 +23,13 @@ from pathlib import Path
 MANIFEST_FILE = "orpheus-manifest.json"
 MANIFEST_VERSION = 1
 
+# Only these files are needed to serve a backend. Pulling the whole HF
+# snapshot drags in docs, samples, and unrelated weights; default to the
+# weights the worker actually loads. Override with --files.
+DEFAULT_PATTERNS = {
+    "kokoro": ["config.json", "kokoro-v1_0.pth", "voices/*.pt"],
+}
+
 
 def fail(msg: str) -> "NoReturn":  # noqa: F821
     print(f"error: {msg}", file=sys.stderr)
@@ -71,6 +78,9 @@ def main() -> None:
     ap.add_argument("--models-dir", default=str(default_models_dir()))
     ap.add_argument("--offline", action="store_true", help="local files only, no network")
     ap.add_argument("--dry-run", action="store_true", help="print plan, download nothing")
+    ap.add_argument("--files", default="",
+                    help="comma-separated glob patterns to pull "
+                         "(default: backend-specific, e.g. only weights for kokoro)")
     args = ap.parse_args()
 
     rel = validate_id(args.id)
@@ -107,12 +117,18 @@ def main() -> None:
         os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
     model_dir.mkdir(parents=True, exist_ok=True)
+    patterns = [p.strip() for p in args.files.split(",") if p.strip()]
+    if not patterns:
+        patterns = DEFAULT_PATTERNS.get(args.backend)
+    if patterns:
+        print(f"files:   {', '.join(patterns)}")
     try:
         snapshot_download(
             repo_id=args.repo,
             revision=args.rev if not args.offline else None,
             local_dir=str(model_dir),
             local_dir_use_symlinks=False,
+            allow_patterns=patterns,
         )
     except Exception as e:
         fail(f"download failed: {e}")
