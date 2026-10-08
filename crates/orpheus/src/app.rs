@@ -1478,7 +1478,7 @@ impl App {
             }
             Screen::Directory => "Enter open · r rescan · Esc back · q quit".into(),
             Screen::Reader => {
-                "Space play · ←/→ seek · n/p chapter · j/k scroll · / search · x export · ? help"
+                "Space play · ←/→ sentence · shift+←/→ seek · n/p chapter · j/k scroll · / search · x export · ? help"
                     .into()
             }
             _ => "Esc back · q quit".into(),
