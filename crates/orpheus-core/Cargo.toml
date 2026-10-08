@@ -24,3 +24,4 @@ epub.workspace = true
 html-escape.workspace = true
 ratatui.workspace = true
 tracing.workspace = true
+pdf-extract = "0.12.1"
