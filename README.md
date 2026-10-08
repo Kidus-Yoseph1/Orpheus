@@ -258,11 +258,14 @@ python3 download.py --id kokoro --repo hexgrad/Kokoro-82M --backend kokoro
 python3 download.py --id openvoice-v2 --repo myshell-ai/OpenVoiceV2 --backend openvoice
 # optional, native cloning instead of conversion (~2.8 GB VRAM, 4 GB download)
 python3 download.py --id chatterbox-turbo --repo ResembleAI/chatterbox-turbo --backend chatterbox-turbo
-# --dry-run to preview, --rev <commit> to pin, --help for all flags
+# --dry-run to preview, --rev <commit> to pin, --offline to reuse your
+# HuggingFace cache, --files to choose which files get pulled, --help for all
 ```
 
-Files land in `~/.local/share/orpheus/models/<id>/` with a manifest;
-nothing hides in the HuggingFace cache. Kokoro is ~360 MB, OpenVoice ~130 MB.
+`download.py` pulls only the files a backend loads (weights, config, voices)
+by default, not the whole repo's docs and samples. Files land in
+`~/.local/share/orpheus/models/<id>/` with a manifest; nothing hides in the
+HuggingFace cache. Kokoro is ~360 MB, OpenVoice ~130 MB.
 
 ### 2. Set up the worker env (once)
 

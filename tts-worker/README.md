@@ -57,8 +57,10 @@ python3 download.py --id kokoro --repo hexgrad/Kokoro-82M --backend kokoro
 python3 download.py --id openvoice-v2 --repo myshell-ai/OpenVoiceV2 --backend openvoice
 ```
 
-Options: `--dry-run` to preview, `--rev <commit>` to pin (resolved commit
-is recorded in the manifest), `--models-dir`, `--offline`.
+`download.py` pulls only the files a backend loads by default (weights,
+config, voices), not the whole repo's docs and samples; override with
+`--files`. Options: `--dry-run` to preview, `--rev <commit>` to pin (resolved
+commit is recorded in the manifest), `--models-dir`, `--offline`, `--files`.
 
 ## Serve
 
