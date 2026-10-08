@@ -241,7 +241,7 @@ fn run(
                 return;
             }
             Err(e) => {
-                let _ = tx.send(Event::Failed(format!("sentence {}: {e}", i + 1)));
+                let _ = tx.send(Event::Failed(sentence_error(i, &e)));
                 return;
             }
         }
@@ -291,6 +291,16 @@ fn synthesize_with_retry(
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Sentence failures carry the raw backend text; say what to *do* about the
+/// one people actually hit: another model squatting on a small GPU.
+fn sentence_error(index: usize, err: &str) -> String {
+    let mut msg = format!("sentence {}: {err}", index + 1);
+    if err.contains("out of memory") || err.contains("CUDA out of") {
+        msg.push_str(" — the GPU is busy: close the other session or press m to switch models");
+    }
+    msg
 }
 
 fn transient(err: &str) -> bool {
@@ -397,6 +407,18 @@ mod tests {
         assert!(!Phase::Cancelled.is_active());
         assert!(!Phase::Failed("x".into()).is_active());
         assert!(!Phase::Done(PathBuf::from("/x")).is_active());
+    }
+
+    #[test]
+    fn oom_errors_get_an_actionable_hint() {
+        let msg = sentence_error(1, "synthesis failed: CUDA out of memory");
+        assert!(msg.contains("sentence 2:"));
+        assert!(msg.contains("GPU is busy"));
+        assert!(
+            sentence_error(0, "voice 'x' sample is 3s — chatterbox needs 6s+")
+                .starts_with("sentence 1: voice 'x'")
+        );
+        assert!(!sentence_error(0, "voice 'x' sample is 3s").contains("GPU is busy"));
     }
 
     #[test]
