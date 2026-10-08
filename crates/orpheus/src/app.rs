@@ -88,6 +88,8 @@ pub struct App {
     pub worker_waiting: bool,
     /// When the current worker spawn happened (load timeout budget).
     pub worker_load_started: std::time::Instant,
+    /// Ticks spent asking a foreign worker on our port to leave.
+    pub worker_evict_attempts: u8,
     pub worker_paths: crate::worker_ctl::WorkerPaths,
     /// Sample length per reference path, keyed by (path, mtime): ffprobe is
     /// ~30ms and the picker lists every clone, so probe once per file.
@@ -407,6 +409,7 @@ impl App {
             worker: Default::default(),
             worker_waiting: false,
             worker_load_started: std::time::Instant::now(),
+            worker_evict_attempts: 0,
             voice_dur_cache: std::collections::HashMap::new(),
             worker_paths: crate::worker_ctl::WorkerPaths {
                 script: (!config.tts.worker_script.is_empty())

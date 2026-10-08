@@ -90,7 +90,7 @@ fn main() -> Result<()> {
 
     run_tui(&mut app)?;
     // Shut the worker down with the reader (it holds VRAM).
-    app.worker.stop();
+    app.worker.shutdown(&app.rt);
     // Persist on exit.
     app.persist_position();
     app.config.reader.theme = app.theme.name.clone();
@@ -157,15 +157,15 @@ fn worker_check(app: &mut App) -> Result<()> {
             ),
             Err(e) => {
                 println!("  synthesis ✗ {e}");
-                app.worker.stop();
+                app.worker.shutdown(&app.rt);
                 return Ok(());
             }
         }
-        app.worker.stop();
+        app.worker.shutdown(&app.rt);
         println!("  worker stopped (freeing VRAM)");
     } else {
         println!("✗ worker did not become ready (missing model or env?)");
-        app.worker.stop();
+        app.worker.shutdown(&app.rt);
     }
     Ok(())
 }

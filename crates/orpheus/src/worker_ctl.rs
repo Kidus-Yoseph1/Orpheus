@@ -2,11 +2,16 @@
 //!
 //! Why Rust owns it: one worker serves one model, and on a 4 GB card two
 //! models cannot stay resident (kokoro ≈ 1.4 GB + chatterbox-turbo ≈ 2.8 GB
-//! > VRAM). So switching models means: kill the old process, spawn one for
-//! the new model, wait for it to load, keep playing. Spawn is non-blocking;
-//! health is polled from the UI tick.
+//! > VRAM). So switching models means: stop the old worker, spawn one for
+//! the new model, wait for it to load, keep playing.
+//!
+//! The port is shared state: a worker started by hand — or orphaned by a
+//! hard kill — is already listening. Before spawning, we ask what it serves
+//! and either adopt it (same model: skip a 32 s reload) or tell it to exit
+//! so the right one can take the port.
 
 use std::fs::File;
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -32,8 +37,13 @@ impl Default for WorkerPaths {
 #[derive(Debug)]
 pub struct WorkerHandle {
     child: Option<Child>,
-    /// Model id the running process serves (None = nothing running).
+    /// Model id the running process serves (None = nothing of ours runs).
     pub running_model: Option<String>,
+    /// True when we did not spawn it — a pre-existing worker we took over.
+    adopted: bool,
+    adopted_url: Option<String>,
+    /// Foreign worker we asked to leave but that hasn't (no /shutdown, etc).
+    evict_attempts: u8,
     pub last_error: Option<String>,
 }
 
@@ -42,6 +52,9 @@ impl Default for WorkerHandle {
         Self {
             child: None,
             running_model: None,
+            adopted: false,
+            adopted_url: None,
+            evict_attempts: 0,
             last_error: None,
         }
     }
@@ -117,6 +130,10 @@ fn resolve_python(paths: &WorkerPaths) -> Vec<PathBuf> {
     v
 }
 
+fn port_busy(port: u16) -> bool {
+    TcpStream::connect(("127.0.0.1", port)).is_ok()
+}
+
 /// Worker output goes to a file: with stdout/stderr nulled a crashing worker
 /// looked identical to a slow one.
 fn log_file(model: &str) -> Option<File> {
@@ -140,22 +157,63 @@ impl WorkerHandle {
         }
     }
 
-    /// Kill the worker (frees VRAM). Safe when nothing runs.
+    pub fn owns_model(&mut self, model: &str) -> bool {
+        if self.running_model.as_deref() != Some(model) {
+            return false;
+        }
+        if self.adopted {
+            return true;
+        }
+        self.is_running()
+    }
+
+    /// Take over a worker we didn't start (it already serves our model).
+    pub fn adopt(&mut self, model: String, url: String) {
+        self.child = None;
+        self.running_model = Some(model);
+        self.adopted = true;
+        self.adopted_url = Some(url);
+        self.evict_attempts = 0;
+        self.last_error = None;
+    }
+
+    /// Forget a worker that went away (or that we asked to leave).
+    pub fn disown(&mut self) {
+        self.child = None;
+        self.running_model = None;
+        self.adopted = false;
+        self.adopted_url = None;
+    }
+
+    /// Kill our own child (frees VRAM). Safe when nothing runs.
     pub fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
         }
-        self.running_model = None;
+        self.disown();
+    }
+
+    /// Stop whatever we are responsible for: adopted workers are asked over
+    /// HTTP (not ours to kill), our own child is killed outright.
+    pub fn shutdown(&mut self, rt: &tokio::runtime::Runtime) {
+        if let Some(url) = self.adopted_url.clone() {
+            if let Ok(w) = orpheus_tts::WorkerBackend::new(url, String::new()) {
+                let _ = rt.block_on(w.shutdown());
+            }
+            self.disown();
+            return;
+        }
+        self.stop();
     }
 
     /// Ensure a worker serves `model`. Returns true when the process for
     /// this model is (already) running.
     pub fn ensure(&mut self, model: &str, port: u16, paths: &WorkerPaths) -> bool {
-        if !self.is_running() {
+        if !self.is_running() && !self.adopted {
             self.running_model = None;
         }
-        if self.running_model.as_deref() == Some(model) && self.is_running() {
+        if self.owns_model(model) {
             return true;
         }
         self.stop(); // wrong model or dead process: release VRAM first
@@ -184,6 +242,9 @@ impl WorkerHandle {
                 Ok(child) => {
                     self.child = Some(child);
                     self.running_model = Some(model.to_string());
+                    self.adopted = false;
+                    self.adopted_url = None;
+                    self.evict_attempts = 0;
                     self.last_error = None;
                     return true;
                 }
@@ -198,15 +259,30 @@ impl WorkerHandle {
     }
 }
 
-/// Called every tick: keeps a worker alive for the selected model and
-/// surfaces load progress. Never blocks.
+/// Model id answering on `url`, or `Err` when nothing replies.
+pub fn serving_model(
+    rt: &tokio::runtime::Runtime,
+    url: &str,
+) -> std::result::Result<Option<String>, ()> {
+    let w = orpheus_tts::WorkerBackend::new(url, String::new()).map_err(|_| ())?;
+    rt.block_on(w.serving_model()).map_err(|_| ())
+}
+
+fn evict(rt: &tokio::runtime::Runtime, url: &str) {
+    if let Ok(w) = orpheus_tts::WorkerBackend::new(url, String::new()) {
+        let _ = rt.block_on(w.shutdown());
+    }
+}
+
+/// Called every tick: keeps one worker alive for the selected model and
+/// surfaces load progress. Never blocks for long.
 pub fn supervise(app: &mut App) {
     if !app.config.tts.manage_worker {
         return;
     }
     let model = app.tts.current_model_id.clone();
     if !app.worker_supported() {
-        app.worker.stop();
+        app.worker.shutdown(&app.rt);
         return;
     }
     let url = app.config.tts.worker_url.clone();
@@ -216,26 +292,64 @@ pub fn supervise(app: &mut App) {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(8765);
     let paths = app.worker_paths.clone();
-    let already =
-        app.worker.running_model.as_deref() == Some(model.as_str()) && app.worker.is_running();
 
-    if !already {
-        if app.worker.ensure(&model, port, &paths) {
-            app.worker_waiting = true;
-            app.worker_load_started = std::time::Instant::now();
-            app.status_msg = Some(format!("⏳ starting {model}… (first load takes a moment)"));
-        } else if let Some(e) = app.worker.last_error.clone() {
-            app.worker_waiting = false;
-            app.status_msg = Some(format!("tts: {e}"));
+    if app.worker.owns_model(&model) {
+        if !app.worker_waiting {
+            return;
         }
+        wait_until_ready(app, &model, &url);
         return;
     }
+
+    // Reconcile whatever is already on the port before spawning.
+    match serving_model(&app.rt, &url) {
+        Ok(Some(serving)) if serving == model => {
+            app.worker.adopt(model.clone(), url);
+            app.worker_waiting = false;
+            app.worker_evict_attempts = 0;
+            app.status_msg = Some(format!("{model} worker already running — adopted"));
+            return;
+        }
+        Ok(Some(serving)) => {
+            if app.worker_evict_attempts >= 6 {
+                // No /shutdown route (older worker) or it refuses to die.
+                app.status_msg = Some(format!(
+                    "tts: a {serving} worker holds the port and won't stop — kill it manually"
+                ));
+                return;
+            }
+            app.worker_evict_attempts += 1;
+            evict(&app.rt, &url);
+            app.status_msg = Some(format!("releasing the port from {serving}…"));
+            return; // next tick spawns ours
+        }
+        Ok(None) if port_busy(port) => {
+            app.status_msg = Some(format!("waiting for book-tts on port {port}…"));
+            return;
+        }
+        Err(()) if port_busy(port) => {
+            app.status_msg = Some(format!("waiting for book-tts on port {port}…"));
+            return;
+        }
+        _ => {}
+    }
+
+    if app.worker.ensure(&model, port, &paths) {
+        app.worker_waiting = true;
+        app.worker_load_started = std::time::Instant::now();
+        app.status_msg = Some(format!("⏳ starting {model}… (first load takes a moment)"));
+    } else if let Some(e) = app.worker.last_error.clone() {
+        app.worker_waiting = false;
+        app.status_msg = Some(format!("tts: {e}"));
+    }
+}
+
+/// Poll `/health` while our own worker loads; fail loudly instead of showing
+/// `⏳` forever.
+fn wait_until_ready(app: &mut App, model: &str, url: &str) {
     if !app.worker_waiting {
         return;
     }
-
-    // Time-box the wait: a worker that never answers has failed, and the user
-    // deserves an error instead of a permanent "⏳".
     let waited = app.worker_load_started.elapsed().as_secs();
     let timeout = if model.starts_with("chatterbox") {
         180
@@ -243,7 +357,7 @@ pub fn supervise(app: &mut App) {
         90
     };
     if waited > timeout {
-        app.worker.stop();
+        app.worker.shutdown(&app.rt);
         app.worker_waiting = false;
         app.playback = PlaybackState::Paused;
         app.buffering = false;
@@ -254,7 +368,7 @@ pub fn supervise(app: &mut App) {
     }
 
     use orpheus_tts::TTSBackend;
-    let Ok(worker) = orpheus_tts::WorkerBackend::new(url, model.clone()) else {
+    let Ok(worker) = orpheus_tts::WorkerBackend::new(url.to_string(), model.to_string()) else {
         app.worker_waiting = false;
         return;
     };
@@ -266,8 +380,15 @@ pub fn supervise(app: &mut App) {
                 app.status_msg = None;
             }
         }
-    } else if !app.worker.is_running() {
-        // Process vanished (crash on load): report, stop looping.
+        return;
+    }
+    if app.worker.adopted {
+        // It answered before and went away: drop ownership, respawn.
+        app.worker.disown();
+        app.status_msg = Some(format!("tts: {model} worker disappeared"));
+        return;
+    }
+    if !app.worker.is_running() {
         app.worker_waiting = false;
         app.playback = PlaybackState::Paused;
         app.buffering = false;
@@ -311,5 +432,21 @@ mod tests {
             let err = h.last_error.clone().unwrap_or_default();
             assert!(err.contains("worker_script"), "got: {err}");
         }
+    }
+
+    #[test]
+    fn adopted_worker_counts_as_owned() {
+        let mut h = WorkerHandle::default();
+        h.adopt("chatterbox-turbo".into(), "http://127.0.0.1:8765".into());
+        assert!(h.owns_model("chatterbox-turbo"));
+        assert!(!h.owns_model("kokoro"));
+        h.disown();
+        assert!(!h.owns_model("chatterbox-turbo"));
+    }
+
+    #[test]
+    fn port_probe_is_safe_when_nothing_listens() {
+        // Port 1 is never open; this only asserts it doesn't panic.
+        assert!(!port_busy(1));
     }
 }
