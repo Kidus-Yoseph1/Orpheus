@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/orpheus-core", "crates/orpheus-tts", "crates/orpheus"]
+members = ["crates/orpheus-core", "crates/orpheus-tts", "crates/orpheus", "crates/orpheus-gui"]
 resolver = "2"
 
 [workspace.package]

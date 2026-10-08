@@ -439,6 +439,8 @@ orpheus --worker-check --model chatterbox-turbo
 Workspace crates:
 
 - `crates/orpheus` — binary: CLI, TUI screens, key handling
+- `crates/orpheus-gui` — native GUI (egui/eframe) reusing core + tts; same
+  palette, centered column, per-sentence highlight
 - `crates/orpheus-core` — `Document → Chapter → Block → Sentence` model,
   EPUB loader, text normalization, themes, config, SQLite, scanner
 - `crates/orpheus-tts` — `TTSBackend` trait, `TtsManager`, `MockBackend`,
@@ -448,6 +450,7 @@ Workspace crates:
 
 ```sh
 cargo build              # debug build
+cargo run -p orpheus-gui -- ~/Books/book.epub   # native GUI (needs the worker)
 cargo test               # segmentation, EPUB + stable IDs, DB resume,
                          # store manifests, Rust/Python cache-key parity,
                          # voice selection rules, worker discovery, ffplay stub
